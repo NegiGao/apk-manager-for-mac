@@ -104,8 +104,10 @@ python3 tools/build_app.py     # → build/APK Manager.app
 APK 的 zip 中央目录，然后只取 `AndroidManifest.xml` 和 `resources.arsc` 两段（通过
 `adb exec-out` 的 `tail`/`head`），在本地解析，再按界面语言挑选对应的标签。结果按包名缓存。
 
-**启动路径上没有重活。** 先把 HTTP 端口监听起来，adb 守护进程放后台线程预热，界面两者都不等——
-即使 `adb start-server` 要好几秒，窗口也在 0.2 秒左右出来。
+**启动路径上没有重活。** 启动器只负责 `exec` 到 Python，不再为了挑端口多起一次解释器。
+Python 会在**导入服务端模块之前**先绑好监听套接字并拉起浏览器，让浏览器冷启动和 import 并行进行。
+字节码在打包时预编译进 bundle（放在 /Applications 里的 `.app` 写不了 `__pycache__`，否则每次启动都要重编）。
+adb 守护进程在后台线程预热，用过的浏览器会记住。程序已在运行时再次打开会复用现有实例，不会起第二个服务。
 
 ---
 

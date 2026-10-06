@@ -17,80 +17,29 @@ from make_icon import build_icns  # noqa: E402
 
 LAUNCHER = r'''#!/bin/bash
 # APK 安装管家 —— .app 启动器
-export LC_ALL=zh_CN.UTF-8 2>/dev/null
+# 只做一件事：找到 python3 然后 exec 过去。挑端口、开窗口都交给 Python，
+# 这样整个冷启动路径上只有一次解释器启动。
 BUNDLE="$(cd "$(dirname "$0")/../.." && pwd)"
 RES="$BUNDLE/Contents/Resources"
-SUPPORT="$HOME/Library/Application Support/APK安装管家"
-LOGDIR="$HOME/Library/Logs"
-LOG="$LOGDIR/APK安装管家.log"
-mkdir -p "$SUPPORT" "$LOGDIR"
+LOG="$HOME/Library/Logs/APK安装管家.log"
+mkdir -p "$HOME/Library/Logs"
 
-BROWSERS=(
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-  "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
-  "/Applications/Vivaldi.app/Contents/MacOS/Vivaldi"
-  "/Applications/Chromium.app/Contents/MacOS/Chromium"
-)
-
-launch_browser() {   # $1=可执行文件 $2=网址
-  "$1" --app="$2" --window-size=1280,880 \
-       --no-first-run --no-default-browser-check >/dev/null 2>&1 &
-}
-
-open_window() {
-  local url="$1" b
-  # 第一轮：优先用「已经在运行」的浏览器，窗口瞬间就出来，不用冷启动
-  for b in "${BROWSERS[@]}"; do
-    if [ -x "$b" ] && pgrep -x "$(basename "$b")" >/dev/null 2>&1; then
-      launch_browser "$b" "$url"; return 0
-    fi
-  done
-  # 第二轮：装了但没开，冷启一个应用窗口
-  for b in "${BROWSERS[@]}"; do
-    if [ -x "$b" ]; then launch_browser "$b" "$url"; return 0; fi
-  done
-  # 都没有就交给默认浏览器
-  open "$url" >/dev/null 2>&1
-}
-
-# 已经在运行就只把窗口重新打开
-if [ -f "$SUPPORT/port" ]; then
-  OLD=$(cat "$SUPPORT/port" 2>/dev/null)
-  if [ -n "$OLD" ] && curl -s -o /dev/null -m 1 "http://127.0.0.1:$OLD/api/ping"; then
-    open_window "http://127.0.0.1:$OLD/"
-    exit 0
-  fi
-fi
-
+# Homebrew 的 python3 排在前面：/usr/bin/python3 是 Xcode 命令行工具的转发壳，
+# 每次启动都要多走一次 xcrun 查找，明显更慢。
 PY=""
-for c in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
   [ -x "$c" ] && PY="$c" && break
 done
-[ -z "$PY" ] && command -v python3 >/dev/null 2>&1 && PY="$(command -v python3)"
 if [ -z "$PY" ]; then
   osascript -e 'display alert "缺少 Python 3" message "请在「终端」里执行一次：xcode-select --install
 装好后再打开本程序。" as critical'
   exit 1
 fi
 
-PORT=$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));p=s.getsockname()[1];s.close();print(p)')
-echo "$PORT" > "$SUPPORT/port"
 cd "$RES" || exit 1
-"$PY" app.py --port "$PORT" --no-browser --auto-quit 25 >>"$LOG" 2>&1 &
-SRV=$!
-
-URL="http://127.0.0.1:$PORT/"
-# 用 bash 内建的 /dev/tcp 探测，不 fork curl；端口一通立刻开窗
-for i in $(seq 1 200); do
-  (exec 3<>/dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && break
-  sleep 0.03
-done
-open_window "$URL"
-wait $SRV
-rm -f "$SUPPORT/port"
+exec "$PY" app.py --app-mode >>"$LOG" 2>&1
 '''
+
 
 
 def build():
@@ -111,6 +60,11 @@ def build():
         shutil.copytree(os.path.join(SRC, folder), os.path.join(res, folder),
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
+    # 预编译字节码，省掉每次启动的编译开销（bundle 目录通常不可写）
+    import compileall
+    compileall.compile_dir(os.path.join(res, "core"), quiet=1, force=True)
+    compileall.compile_file(os.path.join(res, "app.py"), quiet=1, force=True)
+
     # 图标
     build_icns(os.path.join(res, "app.icns"))
 
@@ -127,8 +81,8 @@ def build():
         "CFBundleExecutable": "launcher",
         "CFBundleIconFile": "app.icns",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "1.3",
-        "CFBundleVersion": "1.3",
+        "CFBundleShortVersionString": "1.4",
+        "CFBundleVersion": "1.4",
         "CFBundleInfoDictionaryVersion": "6.0",
         "LSMinimumSystemVersion": "10.13",
         "NSHighResolutionCapable": True,

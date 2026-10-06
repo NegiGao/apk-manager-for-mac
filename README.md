@@ -118,9 +118,13 @@ tens of gigabytes. Instead the app reads the remote APK's zip central directory,
 parses them locally, and picks the label matching your UI language. Results are cached per
 package.
 
-**Startup is kept off the critical path.** The HTTP port is bound before anything else, the adb
-daemon warms up on a background thread, and the UI renders without waiting for either — the
-window is up in about 0.2 s even when `adb start-server` takes seconds.
+**Startup is kept off the critical path.** The launcher is a single `exec` into Python — no second
+interpreter just to pick a port. Python binds the listening socket and spawns the browser *before*
+importing the server modules, so the browser's cold start overlaps with Python's imports. Bytecode
+is precompiled into the bundle (a `.app` in /Applications can't write `__pycache__`, so otherwise
+every launch recompiles), the adb daemon warms up on a background thread, and the chosen browser is
+remembered between runs. Relaunching while it's already running reuses the instance instead of
+starting a second server.
 
 ---
 

@@ -12,14 +12,9 @@ import time
 import uuid
 
 from . import apkinfo as AI
-from .adbkit import Adb, AdbError, RemoteApkReader, SUPPORT_DIR, BASE_DIR, ensure_dir
-
-STAGING_DIR = os.path.join(SUPPORT_DIR, "staging")
-ICON_DIR = os.path.join(SUPPORT_DIR, "icons")
-PROFILE_FILE = os.path.join(SUPPORT_DIR, "profiles.json")
-QUEUE_FILE = os.path.join(SUPPORT_DIR, "queue.json")
-SETTINGS_FILE = os.path.join(SUPPORT_DIR, "settings.json")
-LABEL_CACHE_FILE = os.path.join(SUPPORT_DIR, "label_cache.json")
+from .adbkit import Adb, AdbError, RemoteApkReader
+from .paths import (SUPPORT_DIR, BASE_DIR, ensure_dir, STAGING_DIR, ICON_DIR,
+                    PROFILE_FILE, QUEUE_FILE, SETTINGS_FILE, LABEL_CACHE_FILE)
 
 DEFAULT_SETTINGS = {
     "allowDowngrade": True,       # -d

@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """本地 HTTP 服务：给浏览器界面提供 API（仅监听 127.0.0.1）。"""
 import json
-import mimetypes
 import os
 import queue
 import re
@@ -11,8 +10,18 @@ import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .engine import Engine, STAGING_DIR, ICON_DIR, human_size
-from .adbkit import download_platform_tools, find_adb, BASE_DIR
+from .paths import STAGING_DIR, ICON_DIR, BASE_DIR
+
+# 只服务这几种静态文件，用小表代替 mimetypes 模块
+CTYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".svg": "image/svg+xml", ".ico": "image/x-icon",
+    ".md": "text/plain; charset=utf-8", ".txt": "text/plain; charset=utf-8",
+}
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 TOKEN = uuid.uuid4().hex
@@ -29,6 +38,7 @@ class Boot(object):
     def start(self):
         def run():
             try:
+                from .engine import Engine   # 这一步连带导入 zipfile/apkinfo，放后台
                 self.engine = Engine()
                 Handler.engine = self.engine
             except Exception as exc:
@@ -248,6 +258,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/adb/download":
                 def run():
                     try:
+                        from .adbkit import download_platform_tools, find_adb
                         p = download_platform_tools(
                             progress=lambda m: E.bus.emit("adb", text=m))
                         E.adb.path = p or find_adb()
@@ -305,17 +316,27 @@ class Handler(BaseHTTPRequestHandler):
     def _file(self, path, ctype=None):
         if not os.path.isfile(path):
             return self._send(404, "not found", "text/plain; charset=utf-8")
-        ctype = ctype or (mimetypes.guess_type(path)[0] or "application/octet-stream")
-        if ctype.startswith("text/") or ctype in ("application/javascript",):
-            ctype += "; charset=utf-8"
+        if not ctype:
+            ext = os.path.splitext(path)[1].lower()
+            ctype = CTYPES.get(ext, "application/octet-stream")
         with open(path, "rb") as f:
             data = f.read()
         self._send(200, data, ctype)
 
 
-def serve(port=0, open_browser=True):
-    # 先把端口监听起来（毫秒级），引擎在后台初始化，窗口就能立刻打开
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+def serve(port=0, open_browser=True, sock=None):
+    """sock 不为空时直接接管已经绑好的监听套接字（app.py 在导入本模块之前就绑好了，
+    这样浏览器可以更早启动，和导入过程并行）。"""
+    if sock is not None:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler, bind_and_activate=False)
+        try:
+            httpd.socket.close()          # 丢掉构造函数新建的那个，用传进来的
+        except Exception:
+            pass
+        httpd.socket = sock
+        httpd.server_address = sock.getsockname()
+    else:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     httpd.daemon_threads = True
     boot = Boot().start()
     Handler.boot = boot
