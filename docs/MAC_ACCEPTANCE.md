@@ -2,6 +2,8 @@
 
 **[中文](#中文) · [日本語](#日本語) · [English](#english)**
 
+结果报告 / 結果報告 / Results: [docs/acceptance/macos-isolated-v1.5.3.md](acceptance/macos-isolated-v1.5.3.md) · 已知问题 / 既知の問題 / Known issues: [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+
 ---
 
 ## 中文
