@@ -35,7 +35,8 @@
   版本对不上或包不存在标为「未核验」。设备查询失败（包括 Package Manager 自己报错）、或无法确认设备身份时保持
   **「待核验」**，并保留与安装时那台设备的绑定：绝不把查询失败当成「未安装」，换回原机后先核验，不会重复安装。
 - 完全无法确认目标身份时（既读不到序号，也没有可靠的连接绑定，比如不提供序号的 Wi-Fi 设备），装完一项就停下，
-  之后每一项都要点「继续安装」。因为同一个地址背后可能已经换了另一台手机。
+  之后每一项都要点「继续安装」。因为同一个地址背后可能已经换了另一台手机。「继续」会往下一项走：刚装过的那项保持
+  「未核验」的真实状态，不会被悄悄重装（要重装请选「全部重装」）；因同版本而跳过的项不占这「一项」的名额。
 - 把顺序存成命名方案（比如「新机标配」），下一台设备直接载入。
 - 每个结果都讲清楚：成功显示版本与用时；失败给出真实原因**和**怎么办（签名冲突 → 先卸载；
   设备版本更高 → 勾选允许降级；手机拒绝 → 允许「USB 安装」等等）。
@@ -162,11 +163,11 @@ adb 守护进程在后台线程预热，用过的浏览器会记住。程序已�
 
 ```bash
 sh tests/get_test_apks.sh        # 第一次：下载 3 个开源的真实 APK 到 tests/apks/
-python3 tests/acceptance.py      # 全部 22 个场景（约 10 分钟）
+python3 tests/acceptance.py      # 全部场景（约 10 分钟）；有失败项时退出码非零
 python3 tests/acceptance.py 10 13  # 只跑部分场景
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # 用 3.9 运行程序
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # 保留 adb 命令记录
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.2.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.3.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # 确认诊断脚本对 adb 只执行 `adb version`
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # 用同一套测试跑旧代码
 ```

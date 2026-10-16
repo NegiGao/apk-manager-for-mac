@@ -928,6 +928,72 @@ def s20():
         I.close()
 
 
+def _s20_continue_all(name, skip, preinstalled):
+    """身份未知的 Wi-Fi 设备上装 3 个 APK，一直点「继续」直到结束；数每个 APK 实际发起了几次 install。"""
+    I = Inst(name, FAST, {"skipSameVersion": skip})
+    try:
+        I.ctl(".serialno_empty", "1")
+        I.ctl(".wireless", WIFI)
+        for key, pkg in preinstalled:
+            I.preinstall(key, pkg)
+        I.wait(lambda: I.sup()["devicesAt"] and len(I.sup()["devices"]) == 2, what="设备")
+        time.sleep(1.5)
+        order = ("newpipe", "termux", "seal")
+        import_all(I, order)
+        def ended():
+            return any(e["type"] in ("install_done", "install_paused") for e in I.events)
+        I.events.clear()
+        r = I.post("/api/install", {"serial": WIFI, "mode": "all"})
+        presses, finished = 0, False
+        for _ in range(8):
+            I.wait(ended, timeout=30, what="本轮结束")
+            if any(e["type"] == "install_done" for e in I.events):
+                finished = True
+                break
+            I.events.clear()
+            r = I.post("/api/install/continue", {})
+            presses += 1
+            if not r.get("ok"):
+                break
+        counts = {k: len(after(I, 0, r"install .*%s\.apk" % k)) for k in order}
+        st = items(I)
+        return I, finished, presses, counts, st, r
+    except Exception:
+        I.close()
+        raise
+
+
+def s20b_continue():
+    print("\n[20b] 身份未知时一直点「继续」：每项只装一次，队列能走到底（跳过同版本 关 / 开）")
+    I, finished, presses, counts, st, r = _s20_continue_all("s20c", False, ())
+    try:
+        check(finished and presses == 2, "跳过同版本=关：点 %d 次继续后结束（期望 2 次，结束=%s）" % (presses, finished))
+        check(all(v == 1 for v in counts.values()), "每个 APK 只发起 1 次安装（%s）" % counts)
+        check(all(st[k]["status"] == "unverified" and st[k]["code"] == "verify_identity_unknown"
+                  for k in ("NewPipe", "Termux", "Seal")),
+              "已装过的项保持「未核验（身份未知）」的真实状态，没有被说成成功（%s）" % {
+                  k: st[k]["status"] for k in ("NewPipe", "Termux", "Seal")})
+        r2 = I.post("/api/install/continue", {})
+        check(not r2.get("ok") and r2.get("code") == "nothing_remaining", "结束后再点继续：没有可装的（%s）" % r2.get("code"))
+        t = time.time()
+        I.events.clear()
+        r3 = I.post("/api/install", {"serial": WIFI, "mode": "all"})
+        I.wait(lambda: any(e["type"] in ("install_done", "install_paused") for e in I.events), timeout=30, what="重装")
+        n = len(after(I, t, r"install .*newpipe\.apk"))
+        check(r3.get("ok") and n == 1, "明确选「全部重装」时才会重装第 1 项（%d 次）" % n)
+    finally:
+        I.close()
+
+    # 跳过同版本=开，第 1 项设备上已是同版本：跳过不算「一次机会」
+    I, finished, presses, counts, st, r = _s20_continue_all("s20d", True, (("newpipe", "org.schabi.newpipe"),))
+    try:
+        check(finished and presses == 1, "跳过同版本=开：点 %d 次继续后结束（期望 1 次，结束=%s）" % (presses, finished))
+        check(counts == {"newpipe": 0, "termux": 1, "seal": 1}, "已是同版本的不装，其余各装 1 次（%s）" % counts)
+        check(st["NewPipe"]["status"] == "skipped", "跳过的项标为已跳过（%s）" % st["NewPipe"]["status"])
+    finally:
+        I.close()
+
+
 def _launch_app(home, code_dir=None, extra=None):
     env = dict(os.environ, HOME=home, APKMGR_ADB=os.path.join(HERE_DIR, "fakeadb/adb"),
                APKMGR_BROWSER="/bin/true", FAKE_DEV_ROOT=os.path.join(home, "dev"),
@@ -1059,7 +1125,7 @@ def s22():
 
 ALL = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6, "7": s7, "8": s8, "9": s9,
        "10": s10, "11": s11, "12": s12, "13": s13, "14": s14, "15": s15, "16": s16,
-       "17": s17, "18": s18, "19": s19, "20": s20, "21": s21, "22": s22}
+       "17": s17, "18": s18, "19": s19, "20": s20, "20b": s20b_continue, "21": s21, "22": s22}
 if __name__ == "__main__":
     which = sys.argv[1:] or list(ALL)
     for k in which:
@@ -1072,3 +1138,4 @@ if __name__ == "__main__":
     for good, msg in RESULTS:
         if not good:
             print("未通过：", msg)
+    sys.exit(0 if RESULTS and ok == len(RESULTS) else 1)     # 有失败项 → 非零退出码

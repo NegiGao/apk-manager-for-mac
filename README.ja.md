@@ -40,7 +40,9 @@ Node も Xcode も不要です。外部に必要なのは `adb` だけで、そ�
   ではなく確認から始めます。
 - 対象端末の識別がまったく確認できない場合（シリアルも信頼できる接続の紐付けもない。例：シリアルを返さない
   Wi-Fi 端末）は、1 件入れたところで止まります。続けるときは 1 件ごとに「続きをインストール」を押します。
-  同じアドレスの先が別のスマホに変わっている可能性があるためです。
+  同じアドレスの先が別のスマホに変わっている可能性があるためです。「続き」は次の APK に進みます。直前に入れた
+  APK は「未確認」のまま残し、勝手に入れ直しません（入れ直すときは「すべて再インストール」を選びます）。
+  同じバージョンでスキップした APK は「1 件」に数えません。
 - 並び順に名前を付けて保存（例「新機初期設定」）、次の端末でそのまま読み込み。
 - 結果は毎回説明付き。成功ならバージョンと所要時間、失敗なら原因と**対処方法**（署名不一致 →
   先にアンインストール、端末側が新しい → ダウングレードを許可、端末が拒否 → 「USB 経由のインストール」を許可、など）。
@@ -183,11 +185,11 @@ bind してブラウザを起動するので、ブラウザのコールドスタ
 
 ```bash
 sh tests/get_test_apks.sh        # 初回のみ：オープンソースの実 APK を 3 つ tests/apks/ に取得
-python3 tests/acceptance.py      # 全 22 シナリオ（約 10 分）
+python3 tests/acceptance.py      # 全シナリオ（約 10 分）。失敗があれば終了コードは 0 以外
 python3 tests/acceptance.py 10 13  # 一部だけ
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # アプリを 3.9 で動かす
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # adb コマンド記録を残す
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.2.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.3.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # 診断スクリプトが実行する adb は `adb version` だけであることを確認
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # 同じテストを旧コードで実行
 ```

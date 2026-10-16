@@ -732,11 +732,15 @@ class Engine(object):
         return "bg_paused" if self.sup.bg_paused else None
 
     def _remaining_ids(self, job):
-        """继续安装时要装的项：没成功、没跳过、也不是「待核验」（待核验的绝不重复安装）。"""
+        """继续安装时要装的项：没成功、没跳过、也不是「待核验」（待核验的绝不重复安装）；
+        在这次任务里已经装过、只因设备身份无法确认而「未核验」的项也不算（继续 = 往下一项走，
+        不悄悄重装；要重装请明确选「全部重装」）。"""
+        jid = job.get("jid")
         with self.lock:
             idx = {it["id"]: it for it in self.items}
             return [i for i in job["order"]
-                    if i in idx and idx[i].get("status") not in ("success", "skipped", "pending_verify")]
+                    if i in idx and idx[i].get("status") not in ("success", "skipped", "pending_verify")
+                    and not (jid and idx[i].get("triedJob") == jid)]
 
     def _pending_ids(self, job):
         with self.lock:
@@ -794,6 +798,7 @@ class Engine(object):
                 "done": 0, "ok": 0, "failed": 0, "skipped": 0, "unverified": 0, "pending": 0,
                 "current": None, "currentLabel": None, "remaining": len(pool),
                 "startedAt": time.time(), "results": [], "cancelReq": None,
+                "jid": uuid.uuid4().hex,
             }
             self.save_queue()
         threading.Thread(target=self._install_worker, args=(self.job,), daemon=True).start()
@@ -843,6 +848,9 @@ class Engine(object):
                     it = next((x for x in self.items if x["id"] == iid), None)
                     if it:
                         it.update(status="pending", code=None, arg="")
+                for it in self.items:
+                    if it["id"] in j["order"]:
+                        it.pop("triedJob", None)
                 j.update(serial=rebind_serial, physical=ident, identityKind=kind)
         else:
             why = self._target_check(j)
@@ -966,6 +974,11 @@ class Engine(object):
                                    "at": time.time(), "serial": serial}
             if result["status"] == "success" and job.get("physical"):
                 item["doneOn"] = job["physical"]
+            if result["status"] == "unverified" and result.get("code") == "verify_identity_unknown" \
+                    and job.get("jid"):
+                item["triedJob"] = job["jid"]          # 本任务里已经装过，只是无法核验
+            else:
+                item.pop("triedJob", None)
             if result.get("wasCancel"):
                 item["wasCancel"] = True
             if result["status"] != "pending_verify":
@@ -1057,7 +1070,8 @@ class Engine(object):
                 self.bus.emit("item", id=item_id, status="pending")
                 self._pause_job(job, result["blocked"])
                 return
-            started += 1
+            if "rc" in result or result.get("code") == "exec_error":
+                started += 1                          # 只有真正发起了 install 才算一次（跳过的不算）
             result["seconds"] = round(time.time() - t0, 1)
             result["index"] = job["done"] + 1
             self._record(job, item, result)

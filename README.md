@@ -42,7 +42,9 @@ no Node, no Xcode. The only external dependency is `adb`, which the app can down
   to the original phone checks it instead of installing it again.
 - If the target's identity can't be confirmed at all (no hardware serial and no reliable connection
   binding — e.g. a Wi-Fi device that doesn't report one), the queue installs one APK and stops; press
-  Continue for each next one. Another phone could be behind the same address.
+  Continue for each next one. Another phone could be behind the same address. Continue moves on to the
+  next APK: the one just installed keeps its honest "unverified" status and is not silently reinstalled
+  (choose *reinstall everything* if you want that). Skipped same-version APKs don't use up the one install.
 - Save a named order ("new phone setup") and load it again on the next device.
 - Every result is explained: success with version and elapsed time, failures with the actual
   reason *and* what to do about it (signature clash → uninstall first; device has a newer
@@ -198,11 +200,11 @@ interrupted mid-way, and an install that reports `Success` without actually land
 
 ```bash
 sh tests/get_test_apks.sh        # once: fetches 3 real open-source APKs into tests/apks/
-python3 tests/acceptance.py      # all 22 scenarios (≈10 min)
+python3 tests/acceptance.py      # all scenarios (≈10 min); exits non-zero if anything fails
 python3 tests/acceptance.py 10 13  # just some of them
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # run the app under 3.9
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # keep adb command logs
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.2.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.3.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # the diagnostics script only ever runs `adb version`
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # same tests against old code
 ```
