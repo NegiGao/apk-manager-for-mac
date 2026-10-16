@@ -475,8 +475,8 @@ $("#btnMark").onclick = async () => {
 $("#btnQuit").onclick = async () => {
   if (!confirm(t("tQuit"))) return;
   let r = await api("/api/quit", {});
-  if (!r.ok && r.code === "busy_install") {
-    if (!confirm(t("tQuitBusy"))) return;
+  if (!r.ok && (r.code === "busy_install" || r.code === "busy_extract")) {
+    if (!confirm(t(r.code === "busy_install" ? "tQuitBusy" : "tQuitBusyExtract"))) return;
     r = await api("/api/quit", { force: true });
   }
   if (!r.ok) { toast(t("tCantStart"), errText(r), "err"); return; }

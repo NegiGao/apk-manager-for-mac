@@ -1,7 +1,8 @@
 #!/bin/bash
 # APK Manager —— macOS 只读诊断脚本 / 読み取り専用の診断スクリプト / read-only diagnostics
 #
-# 只读：不重启 adb、不启动 adb 服务、不结束任何进程、不安装/卸载 APK、不改任何设置。
+# 只读：不重启 adb、不启动 adb 服务、不连接 adb 服务、不结束任何进程、不安装/卸载 APK、不改任何设置。
+# 对 adb 只执行 `adb version`（只打印客户端版本，不连接服务）。
 # 読み取りのみ：adb の再起動・起動、プロセス終了、APK の操作、設定変更は一切しません。
 # Read-only: never restarts or starts the adb server, ends no process, installs nothing.
 #
@@ -56,21 +57,15 @@ for c in "$SUP/platform-tools/adb" /opt/homebrew/bin/adb /usr/local/bin/adb \
   if [ -x "$c" ]; then echo "  $c"; "$c" version 2>&1 | head -2 | sed 's/^/      /'; fi
 done
 
-sec "5. adb server (port 5037) — listing only"
+sec "5. adb server (port 5037) — process / port info only"
+# 这里刻意不调用任何会连接 adb 服务的命令：即使服务正在运行也不安全——
+# 服务恰好退出时会被重新拉起；客户端与服务版本不一致时会把共享服务换掉，影响其他软件。
+# 设备列表看第 6 节：那是本程序自己的缓存，读取它不会碰 adb。
 lsof -nP -iTCP:5037 -sTCP:LISTEN 2>/dev/null || echo "  nothing listening on 5037"
 echo "  adb processes:"
 ps -Ao pid=,ppid=,args= | grep -E '(^|[ /])adb( |$)' | grep -v grep | sed 's/^/    /'
-if lsof -nP -iTCP:5037 -sTCP:LISTEN >/dev/null 2>&1; then
-  ADB=$(for c in "$SUP/platform-tools/adb" /opt/homebrew/bin/adb /usr/local/bin/adb "$HOME/Library/Android/sdk/platform-tools/adb"; do [ -x "$c" ] && echo "$c" && break; done)
-  if [ -n "$ADB" ]; then
-    echo "  devices (server already running, so this does not start anything):"
-    "$ADB" devices -l 2>&1 | sed 's/^/    /'
-  fi
-else
-  echo "  (server not running — 'adb devices' skipped because it would start the server)"
-fi
 
-sec "6. APK Manager processes"
+sec "6. APK Manager processes (device list = the app's own cache)"
 ps -Ao pid=,ppid=,etime=,args= | grep -E 'app\.py --app-mode|MacOS/launcher' | grep -v grep | sed 's/^/  /' || true
 if [ -f "$SUP/port" ]; then
   P=$(cat "$SUP/port")

@@ -4,6 +4,8 @@ import json, os, shutil, subprocess, sys, tempfile, threading, time, urllib.requ
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 FAKE_ADB = os.path.join(HERE, "fakeadb", "adb")
+# 被测程序代码目录（默认就是本仓库）。指向旧版本的检出目录，即可用同一套测试跑出「修复前」的结果
+CODE = os.environ.get("APKMGR_TEST_CODE") or REPO
 SC = os.environ.get("APKMGR_TEST_WORK") or os.path.join(tempfile.gettempdir(), "apkmgr-tests")
 APK_DIR = os.environ.get("APKMGR_TEST_APKS") or os.path.join(HERE, "apks")
 # 被测服务用哪个 Python 跑（默认就是跑测试的这个），可以用来在 3.9 上验收
@@ -22,16 +24,16 @@ def free_port():
 
 
 class Inst(object):
-    def __init__(self, name, env_extra=None, settings=None):
+    def __init__(self, name, env_extra=None, settings=None, args=None, code=None):
         self.root = os.path.join(SC, "t_" + name)
         shutil.rmtree(self.root, ignore_errors=True)
         self.home = os.path.join(self.root, "home")
         self.dev = os.path.join(self.root, "dev")
         self.adblog = os.path.join(self.root, "adb.log")
         os.makedirs(self.home); os.makedirs(self.dev)
-        if settings:
-            os.makedirs(os.path.join(self.home, ".apk-installer"), exist_ok=True)
-            json.dump(settings, open(os.path.join(self.home, ".apk-installer", "settings.json"), "w"))
+        settings = dict({"extractDir": self.root}, **(settings or {}))   # 提取的文件留在实例目录里
+        os.makedirs(os.path.join(self.home, ".apk-installer"), exist_ok=True)
+        json.dump(settings, open(os.path.join(self.home, ".apk-installer", "settings.json"), "w"))
         self.port = free_port()
         self.B = "http://127.0.0.1:%d" % self.port
         env = dict(os.environ)
@@ -40,8 +42,9 @@ class Inst(object):
         env.update(env_extra or {})
         self.env = env
         self.name = name
-        self.proc = subprocess.Popen([SERVER_PY, "app.py", "--port", str(self.port), "--no-browser"],
-                                     cwd=REPO, env=env, stdout=open(os.path.join(self.root, "srv.log"), "w"),
+        self.proc = subprocess.Popen([SERVER_PY, "app.py", "--port", str(self.port), "--no-browser"]
+                                     + list(args or []),
+                                     cwd=code or CODE, env=env, stdout=open(os.path.join(self.root, "srv.log"), "w"),
                                      stderr=subprocess.STDOUT)
         self.events = []
         for _ in range(400):
@@ -50,6 +53,22 @@ class Inst(object):
             except Exception:
                 time.sleep(0.025)
         self._listen()
+
+    # ---------------------------------------------------------------- 屏障
+    def hold(self, name, regex, skip=0):
+        """让第 skip+1 条匹配 regex 的 adb 命令停在执行前（命令已发出并记入日志）。"""
+        for f in (".held_" + name, ".holdcount_" + name):
+            try: os.remove(os.path.join(self.dev, f))
+            except FileNotFoundError: pass
+        self.ctl(".hold_" + name, "%s\n%d" % (regex, skip))
+
+    def wait_held(self, name, timeout=30):
+        p = os.path.join(self.dev, ".held_" + name)
+        return self.wait(lambda: os.path.exists(p) and open(p).read(), timeout=timeout,
+                         step=0.02, what="屏障 " + name)
+
+    def release(self, name):
+        self.ctl(".hold_" + name)
 
     # ---------------------------------------------------------------- HTTP
     def post(self, p, o=None, timeout=90):
@@ -114,6 +133,12 @@ class Inst(object):
         shutil.copyfile(APKS[key], os.path.join(d, "base.apk"))
 
     def close(self):
+        try:
+            for f in os.listdir(self.dev):          # 放开所有屏障，免得假 adb 进程挂着
+                if f.startswith(".hold_"):
+                    os.remove(os.path.join(self.dev, f))
+        except Exception:
+            pass
         try:
             self.proc.kill(); self.proc.wait(5)
         except Exception:

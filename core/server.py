@@ -132,10 +132,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._file(os.path.join(WEB_DIR, safe))
             if path == "/api/ping":
                 E0 = self.engine
-                busy = bool(E0 and ((E0.job or {}).get("running") or
-                                    (E0.apps_scan or {}).get("running")))
+                kinds = E0.busy_kinds() if E0 else []
+                # busyProto 2：busy 覆盖安装 / 读取应用列表 / 提取。新版本只信任报告了这个协议的旧实例
                 return self._json({"ok": True, "ready": E0 is not None, "version": VERSION,
-                                   "busy": busy, "pid": os.getpid()})
+                                   "busy": bool(kinds), "busyKinds": kinds, "busyProto": 2,
+                                   "pid": os.getpid()})
             E = self._wait_engine()
             if E is None:
                 return self._json({"ok": False, "booting": True,
@@ -268,14 +269,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(E.stop_app_scan())
             if path == "/api/extract":
                 d = self._json_body()
-                busy = E.busy_reason(d.get("serial"))
-                if busy:
-                    return self._json({"ok": False, "code": busy})
-                threading.Thread(
-                    target=E.extract,
-                    args=(d.get("serial"), d.get("packages") or [], d.get("apps")),
-                    daemon=True).start()
-                return self._json({"ok": True})
+                return self._json(E.start_extract(d.get("serial"), d.get("packages") or [],
+                                                  d.get("apps")))
             if path == "/api/wireless/pair":
                 d = self._json_body()
                 return self._json(E.wireless_pair(d.get("hostPort"), d.get("code")))

@@ -15,6 +15,10 @@
   $ROOT/.swap_after_install 存在 → 安装成功后，无线地址背后换成另一台手机（PHYS-B）
   $ROOT/.transport_id       USB 设备的 transport_id（默认 1）；为空字符串 → 不提供 transport_id
   $ROOT/.replug_after_install 存在 → 安装成功后 USB 被拔插（transport_id 加一，模拟换上同序列号的另一台）
+  $ROOT/.pm_error           存在 → pm 服务报错（shell 本身正常，echo 照常输出）
+  $ROOT/.hold_<名字>        屏障：第一行是正则，第二行（可选）是放行次数 N。
+                            第 N+1 条匹配的命令记录日志后停住，写出 $ROOT/.held_<名字>（内容为参数），
+                            直到测试删掉 .hold_<名字> 才继续执行。用来把并发时序卡在确定的位置。
 每次调用都追加到 $FAKE_ADB_LOG：  时间戳<TAB>参数
 """
 import os, re, sys, time, shutil
@@ -105,9 +109,32 @@ def die(msg, rc=1):
     sys.stderr.write(msg + "\n")
     sys.exit(rc)
 
+def barriers(args):
+    line = " ".join(args)
+    try:
+        names = [n for n in os.listdir(ROOT) if n.startswith(".hold_")]
+    except FileNotFoundError:
+        return
+    for n in sorted(names):
+        name = n[len(".hold_"):]
+        spec = read(n).splitlines()
+        if not spec or not re.search(spec[0], line):
+            continue
+        skip = int(spec[1]) if len(spec) > 1 and spec[1].strip().isdigit() else 0
+        cnt_f = ctl(".holdcount_" + name)
+        cnt = int(open(cnt_f).read() or 0) if os.path.exists(cnt_f) else 0
+        open(cnt_f, "w").write(str(cnt + 1))
+        if cnt < skip:
+            continue
+        open(ctl(".held_" + name), "w").write(line)
+        t0 = time.time()
+        while has(n) and time.time() - t0 < 120:
+            time.sleep(0.02)
+
 def main():
     args = sys.argv[1:]
     log(args)
+    barriers(args)
     serial = None
     while args and args[0] == "-s":
         serial = args[1]; args = args[2:]
@@ -202,11 +229,24 @@ def do_shell(serial, cmdline):
         print("__SN__"); print(physical(serial)); print(""); print("__END__")
         return 0
     if cmdline.startswith("echo __BEGIN__;"):
-        m = re.search(r"pm path (\S+);", cmdline)
+        m = re.search(r"pm path (\S+?)[ ;]", cmdline)
         pkg = m.group(1) if m else ""
         print("__BEGIN__")
-        for p in installed().get(pkg, []):
+        if has(".pm_error"):
+            # 真机上 package 服务异常时的样子：pm 报错、非零退出码，但 shell 和 echo 都正常
+            print("cmd: Can't find service: package")
+            if "__PMRC" in cmdline:
+                print("__PMRC=20"); print("cmd: Can't find service: package"); print("__LSRC=20")
+            print("__END__")
+            return 0
+        paths = installed().get(pkg, [])
+        for p in paths:
             print("package:%s" % p)
+        if "__PMRC" in cmdline:
+            print("__PMRC=%d" % (0 if paths else 1))      # 真 pm path：找不到包时退出码 1、无输出
+            if paths:
+                print("package:%s" % pkg)
+            print("__LSRC=0")
         info = pkg_info(pkg)
         if info:
             print("    versionCode=%s minSdk=21" % info.version_code)
@@ -242,6 +282,8 @@ def do_shell(serial, cmdline):
         return 0
     if cmdline.startswith("ip -f inet addr show wlan0"):
         print("    inet 192.168.1.9/24 brd 192.168.1.255 scope global wlan0"); return 0
+    if cmdline.startswith("pm ") and has(".pm_error"):
+        print("cmd: Can't find service: package"); return 20
     if cmdline.startswith("pm list packages"):
         d = float(read(".slow_pm", "0") or 0)
         if d:

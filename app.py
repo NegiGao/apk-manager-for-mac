@@ -147,10 +147,41 @@ def running_instance():
 
 
 def old_instance_busy(info):
-    if "busy" in info:
-        return bool(info["busy"])
-    st = _http(info["port"], "GET", "/api/state") or {}     # 旧版本：看它的安装任务
-    return bool((st.get("job") or {}).get("running") or (st.get("scan") or {}).get("running"))
+    """True = 忙；False = 确认空闲；None = 无法判断。
+    只有报告 busyProto>=2 的实例，busy 才覆盖安装、读取应用列表和提取 APK；
+    更早的版本（≤1.5.1）不报告「提取中」，无法确认空闲，一律按「未知」处理，不自动关闭。"""
+    try:
+        if int(info.get("busyProto") or 0) >= 2 and "busy" in info:
+            return bool(info["busy"])
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+NOTICE_OLD = {
+    "zh": "已有旧版本 APK Manager（%s）在运行。为避免打断它正在做的事，新版本没有自动关闭它。\n"
+          "请在旧版本窗口里点「退出」，再重新打开新版本。",
+    "ja": "古いバージョンの APK Manager（%s）が動いています。作業を中断しないよう、自動では終了しませんでした。\n"
+          "古いウインドウで「終了」を押してから、新しいバージョンを開き直してください。",
+    "en": "An older APK Manager (%s) is still running. It wasn't closed automatically so nothing it's "
+          "doing gets interrupted.\nQuit it from its window, then open the new version again.",
+}
+
+
+def notify_old_instance(version):
+    """macOS 上弹一个不阻塞的提示；其他系统只写日志。"""
+    if sys.platform != "darwin":
+        return
+    lang = (os.environ.get("LANG") or "").lower()
+    key = "zh" if lang.startswith("zh") else "ja" if lang.startswith("ja") else "en"
+    text = (NOTICE_OLD[key] % version).replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        import subprocess
+        subprocess.Popen(["/usr/bin/osascript", "-e",
+                          'display dialog "%s" buttons {"OK"} default button 1 with title "APK Manager"' % text],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def acquire_lock():
@@ -185,11 +216,16 @@ def settle_existing(app_mode):
         if app_mode:
             open_window(url)
         return True
-    if old_instance_busy(info):
-        # 旧版本正在安装 / 扫描：不能把它关掉，先用它
-        log("旧版本实例 %s 正在工作，暂不替换，打开它的窗口" % info.get("version", "<1.5.1"))
+    busy = old_instance_busy(info)
+    if busy is not False:
+        # 旧版本正在工作，或者无法确认它空闲：不能把它关掉，先用它
+        ver = info.get("version", "<1.5.1")
+        log("旧版本实例 %s %s，暂不替换，打开它的窗口" % (
+            ver, "正在工作（%s）" % ",".join(info.get("busyKinds") or []) if busy else "无法确认是否空闲"))
         if app_mode:
             open_window(url)
+            if busy is None:
+                notify_old_instance(ver)
         return True
     log("发现旧版本实例 %s，空闲，请它退出后由新版本接管" % info.get("version", "<1.5.1"))
     _http(info["port"], "POST", "/api/quit", {})
@@ -219,8 +255,7 @@ def _watchdog(engine, grace):
             if time.time() - start > 120:   # 两分钟都没人打开界面
                 os._exit(0)
             continue
-        busy = (engine.job and engine.job.get("running")) or \
-               (engine.apps_scan and engine.apps_scan.get("running"))
+        busy = engine.busy_kinds()                 # 安装 / 读取应用列表 / 提取：与接管、退出检查同一个判断
         if busy or bus.viewers() > 0:
             continue
         if time.time() - bus.last_seen > grace:

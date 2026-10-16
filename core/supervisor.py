@@ -57,6 +57,7 @@ class Supervisor(object):
         self.wifi_paused = bool(st.get("wifiPaused"))
         self.usb_only = st.get("usbOnly") or None      # {"serial", "physical", "name"}
         self.gen = 0                    # 每次暂停 +1，用来识别并丢弃迟到的结果
+        self.bg_epoch = 0               # 每次「暂停后台」+1：安装核验用它判断结果是否在暂停之后才回来
         self.devices = []
         self.devices_at = None          # 最近一次成功检测的时间
         self.selected = None
@@ -166,9 +167,14 @@ class Supervisor(object):
 
     # ------------------------------------------------------------------ 控制
     def pause_all(self):
+        # 先在门控锁内立起暂停标志：这一步返回后，受门控的 adb 命令不会再被启动
+        with self.E.adb.gate_lock:
+            first = not self.bg_paused
+            self.bg_paused = True
+            if first:
+                self.bg_epoch += 1
         with self.lock:
-            if not self.bg_paused:
-                self.bg_paused = True
+            if first:
                 self.gen += 1
                 self._persist()
         # 暂停后台 = 本程序不再主动碰设备：正在执行的那个 APK 让它装完，但不开始下一项

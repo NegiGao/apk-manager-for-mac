@@ -12,7 +12,7 @@ import time
 import uuid
 
 from . import apkinfo as AI
-from .adbkit import Adb, AdbError, RemoteApkReader
+from .adbkit import Adb, AdbError, AdbBlocked, RemoteApkReader
 from .paths import (SUPPORT_DIR, BASE_DIR, ensure_dir, STAGING_DIR, ICON_DIR,
                     PROFILE_FILE, QUEUE_FILE, SETTINGS_FILE, LABEL_CACHE_FILE)
 
@@ -173,6 +173,7 @@ class Engine(object):
         self.scan_cancel = threading.Event()
         self.label_cache = {}
         self.cur_proc = None       # 当前 adb install 进程（取消当前安装用）
+        self.extracting = {}       # 正在进行的提取任务 token -> serial（计入统一的忙碌判断）
         self._load_all()
         # 所有自动碰设备的动作都交给 Supervisor（单线程、可暂停）
         from .supervisor import Supervisor
@@ -464,7 +465,20 @@ class Engine(object):
         scan = self.apps_scan or {}
         if scan.get("running") and self._same_device(scan.get("serial"), serial):
             return "busy_scan"
+        if any(self._same_device(s, serial) for s in list(self.extracting.values())):
+            return "busy_extract"
         return None
+
+    def busy_kinds(self):
+        """全局忙碌状态：版本接管、退出检查、关窗自动退出都用这一个判断。"""
+        kinds = []
+        if (self.job or {}).get("running"):
+            kinds.append("install")
+        if (self.apps_scan or {}).get("running"):
+            kinds.append("scan")
+        if self.extracting:
+            kinds.append("extract")
+        return kinds
 
     # -- 无线 -----------------------------------------------------------
     def wireless_pair(self, host_port, code):
@@ -703,6 +717,20 @@ class Engine(object):
             return "target_mismatch"
         return None
 
+    def _gate_next(self, job):
+        """是否还允许为「下一项」发起新命令（身份确认、跳过检查、安装）。"""
+        if self.sup.bg_paused:
+            return "bg_paused"
+        if job.get("cancelReq"):
+            return "cancelled"
+        if job.get("pauseAfterCurrent"):
+            return job.get("pendingReason") or "user"
+        return None
+
+    def _gate_verify(self):
+        """是否还允许发起核验查询。暂停后台 = 本程序不再碰设备。"""
+        return "bg_paused" if self.sup.bg_paused else None
+
     def _remaining_ids(self, job):
         """继续安装时要装的项：没成功、没跳过、也不是「待核验」（待核验的绝不重复安装）。"""
         with self.lock:
@@ -775,13 +803,14 @@ class Engine(object):
         return serial == job.get("serial") or (ident and ident == job.get("physical"))
 
     def pause_after_current(self, reason="user"):
-        with self.lock:
+        # 在门控锁内改标志：返回之后，安装线程不会再启动受门控的新命令
+        with self.adb.gate_lock, self.lock:
             j = self.job
             if not j or not j.get("running"):
                 return {"ok": False, "code": "no_running_job"}
-            j["pauseAfterCurrent"] = True
             if not j.get("pendingReason") or reason == "bg_paused":
                 j["pendingReason"] = reason
+            j["pauseAfterCurrent"] = True
         self._emit_job()
         return {"ok": True}
 
@@ -842,7 +871,7 @@ class Engine(object):
     def cancel_current(self):
         """取消正在装的那一个。只对本程序自己启动的那个 adb install 进程（按 PID）发信号，
         不按名字杀进程、不碰 adb 服务；事后去设备上核验实际结果。"""
-        with self.lock:
+        with self.adb.gate_lock, self.lock:
             j = self.job
             if not j or not j.get("running") or not j.get("current"):
                 return {"ok": False, "code": "no_running_job"}
@@ -872,6 +901,8 @@ class Engine(object):
         j = self.job or {}
         if j.get("running") and not force:
             return {"ok": False, "code": "busy_install"}
+        if self.extracting and not force:
+            return {"ok": False, "code": "busy_extract"}
         if j.get("running"):
             with self.lock:
                 for it in self.items:
@@ -919,10 +950,13 @@ class Engine(object):
             notify_mac(notify_text(lang, "paused"), job.get("name") or job["serial"],
                        sound=self.settings.get("sound", True))
 
-    def _record(self, job, item, result):
-        """把一项的结果写进队列（含 adb 退出码和日志尾巴），并更新计数。"""
+    def _record(self, job, item, result, guard=None):
+        """把一项的结果写进队列（含 adb 退出码和日志尾巴），并更新计数。
+        guard：写入前（持锁）再确认一次结果仍然有效；返回 False 就丢弃，什么都不写。"""
         serial = job["serial"]
         with self.lock:
+            if guard is not None and not guard():
+                return False
             prev = item.get("status")
             item["status"] = result["status"]
             item["code"] = result.get("code")
@@ -968,6 +1002,7 @@ class Engine(object):
                       index=result.get("index"), total=job["total"],
                       progress={k: job.get(k, 0) for k in ("done", "ok", "failed", "skipped",
                                                            "unverified", "pending", "total")})
+        return True
 
     def _install_worker(self, job):
         flags = self._flags()
@@ -975,16 +1010,29 @@ class Engine(object):
         self.bus.emit("install_start", serial=job["serial"], total=job["total"])
         self._emit_job()
         idx_map = {it["id"]: it for it in self.items}
+        started = 0                                   # 本次运行已开始安装的项数
         for item_id in order:
             item = idx_map.get(item_id)
             if item is None or item.get("status") in ("success", "skipped", "pending_verify"):
                 continue
-            if job.get("pauseAfterCurrent"):
-                self._pause_job(job, job.get("pendingReason") or "user")
+            stop = self._gate_next(job)
+            if stop:
+                self._pause_job(job, stop)
                 return
-            why = self._target_check(job)
+            # 身份确认本身也受门控：查询期间用户暂停了，就不再发起后续命令
+            try:
+                with self.adb.gated(lambda: self._gate_next(job)):
+                    why = self._target_check(job)
+            except AdbBlocked as b:
+                self._pause_job(job, b.reason)
+                return
             if why:
                 self._pause_job(job, why)
+                return
+            if started and not job.get("physical"):
+                # 目标身份无法确认（读不到序号，也没有可靠的连接绑定）：只装用户点下去的那一项，
+                # 不自动往下装——同一个地址背后可能已经换了机器
+                self._pause_job(job, "target_unconfirmed")
                 return
             with self.lock:
                 job["current"] = item_id
@@ -1000,6 +1048,16 @@ class Engine(object):
 
             t0 = time.time()
             result = self._install_one(job, item, flags)
+            if result.get("blocked"):
+                # 暂停在发起安装前生效：这一项根本没开始装，恢复成未安装
+                with self.lock:
+                    item["status"] = "pending"
+                    item.pop("installingOn", None)
+                    self.save_queue()
+                self.bus.emit("item", id=item_id, status="pending")
+                self._pause_job(job, result["blocked"])
+                return
+            started += 1
             result["seconds"] = round(time.time() - t0, 1)
             result["index"] = job["done"] + 1
             self._record(job, item, result)
@@ -1065,7 +1123,9 @@ class Engine(object):
             out.update(status="pending_verify", code="verify_query_failed", arg="identity")
             return out
         if job.get("physical") and ident != job["physical"]:
-            out.update(status="unverified", code="verify_identity_changed", arg="",
+            # 结果属于原来那台设备，只是现在核验不了：保持「待核验」并保留原设备绑定，
+            # 换回原机后先核验，不会重复安装；也绝不拿另一台的版本判成功
+            out.update(status="pending_verify", code="verify_pending", arg="identity_changed",
                        identity="changed")
             return out
         if not ident:
@@ -1118,6 +1178,7 @@ class Engine(object):
         if not items:
             return {"ok": True, "checked": 0, "resolved": 0, "pending": 0}
         resolved = 0
+        epoch0 = self.sup.bg_epoch
         for item in items:
             if self.sup.bg_paused:
                 break
@@ -1132,11 +1193,27 @@ class Engine(object):
                        "done": 0, "ok": 0, "failed": 0, "skipped": 0, "unverified": 0,
                        "pending": 1, "remaining": 0, "total": 0, "results": []}
             r = dict(id=item["id"], label=item.get("label"), package=item.get("package"))
-            with self.adb.source(source):
-                r.update(self._verify(ctx, item, cancelled=bool(item.get("wasCancel"))))
-            if r["status"] != "pending_verify":
+            try:
+                with self.adb.gated(self._gate_verify), self.adb.source(source):
+                    r.update(self._verify(ctx, item, cancelled=bool(item.get("wasCancel"))))
+            except AdbBlocked:
+                break                                 # 核验途中暂停：剩下的保持待核验
+            if r["status"] == "pending_verify" or r.get("code") == "verify_identity_unknown":
+                # 设备不在 / 身份对不上 / 身份无法确认 / 查询失败：保持待核验与原设备绑定，只更新原因
+                why = "identity_unknown" if r.get("code") == "verify_identity_unknown" else (
+                    r.get("arg") if r.get("code") == "verify_pending" else "query")
+                with self.lock:
+                    if item.get("status") == "pending_verify" and item.get("pendingOn") == b:
+                        item["code"] = "verify_pending"
+                        item["arg"] = why or item.get("arg") or ""
+                continue
+
+            def still_valid(item=item, b=b):
+                # 写入前再确认：没有在查询期间暂停，这一项也没被别的操作改掉
+                return (not self.sup.bg_paused and self.sup.bg_epoch == epoch0
+                        and item.get("status") == "pending_verify" and item.get("pendingOn") == b)
+            if self._record(ctx, item, r, guard=still_valid):
                 resolved += 1
-                self._record(ctx, item, r)
         left = len(self.pending_items())
         if j:
             with self.lock:
@@ -1156,8 +1233,11 @@ class Engine(object):
 
         pkg = item.get("package")
         if pkg and self.settings.get("skipSameVersion"):
-            with self.adb.source("install"):
-                q = self.adb.query_package(serial, pkg)
+            try:
+                with self.adb.source("install"), self.adb.gated(lambda: self._gate_next(job)):
+                    q = self.adb.query_package(serial, pkg)
+            except AdbBlocked as b:
+                return dict(base, blocked=b.reason)
             if q["state"] == "present" and q.get("vc") is not None and \
                     item.get("versionCode") is not None and q["vc"] >= item["versionCode"]:
                 return dict(base, status="skipped", code="already_current",
@@ -1175,9 +1255,11 @@ class Engine(object):
 
         rc = None
         try:
-            with self.adb.source("install"):
+            with self.adb.source("install"), self.adb.gated(lambda: self._gate_next(job)):
                 rc, out = self.adb.install(serial, parts, on_line=on_line, flags=flags,
                                            on_proc=on_proc)
+        except AdbBlocked as b:
+            return dict(base, blocked=b.reason)       # 没有启动任何 adb 进程
         except AdbError as exc:
             return dict(base, status="failed", code="adb_error", arg=str(exc))
         except Exception as exc:
@@ -1199,7 +1281,17 @@ class Engine(object):
         if self.sup.bg_paused:
             return dict(base, **run, status="pending_verify", code="verify_pending",
                         arg="cancel" if cancelled else "bg_paused")
-        return dict(base, **run, **self._verify(job, item, cancelled=cancelled))
+        epoch0 = self.sup.bg_epoch
+        try:
+            with self.adb.gated(self._gate_verify):
+                v = self._verify(job, item, cancelled=cancelled)
+        except AdbBlocked:
+            v = None
+        if v is None or self.sup.bg_paused or self.sup.bg_epoch != epoch0:
+            # 核验途中暂停了后台：查询不再发起；已经在路上的结果也不采用。退出码与日志照样保留
+            return dict(base, **run, status="pending_verify", code="verify_pending",
+                        arg="cancel" if cancelled else "bg_paused")
+        return dict(base, **run, **v)
 
     # -- 设备应用枚举 ----------------------------------------------------
     def start_app_scan(self, serial, scope="third", with_icons=True):
@@ -1319,11 +1411,42 @@ class Engine(object):
         return app
 
     # -- 提取 -----------------------------------------------------------
+    def start_extract(self, serial, packages, apps_meta=None):
+        """先登记为「提取中」再起线程，这样 /api/ping、退出检查、版本接管立刻就能看到。"""
+        busy = self.busy_reason(serial)
+        if busy:
+            return {"ok": False, "code": busy}
+        tok = uuid.uuid4().hex
+        with self.lock:
+            self.extracting[tok] = serial
+        threading.Thread(target=self._extract_thread, args=(tok, serial, packages, apps_meta),
+                         daemon=True).start()
+        return {"ok": True}
+
+    def _extract_thread(self, tok, serial, packages, apps_meta):
+        try:
+            self._extract(serial, packages, apps_meta)
+        except Exception as exc:
+            self.bus.emit("extract_done", total=len(packages), ok=0, results=[], dir="", error=str(exc))
+        finally:
+            with self.lock:
+                self.extracting.pop(tok, None)
+
     def extract(self, serial, packages, apps_meta=None):
         busy = self.busy_reason(serial)
         if busy:
             self.bus.emit("extract_done", total=0, ok=0, results=[], dir="", blocked=busy)
             return {"ok": False, "code": busy}
+        tok = uuid.uuid4().hex
+        with self.lock:
+            self.extracting[tok] = serial
+        try:
+            return self._extract(serial, packages, apps_meta)
+        finally:
+            with self.lock:
+                self.extracting.pop(tok, None)
+
+    def _extract(self, serial, packages, apps_meta=None):
         """把设备上的应用 APK 拉取到「提取APP」文件夹。"""
         out_root = os.path.join(os.path.expanduser(
             self.settings.get("extractDir") or BASE_DIR), "提取APP")

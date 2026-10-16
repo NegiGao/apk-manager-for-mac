@@ -101,12 +101,14 @@ def main():
     ap.add_argument("--py39")
     ap.add_argument("--old14")
     ap.add_argument("--old150")
+    ap.add_argument("--only", help="只跑这些检查，逗号分隔，如 D1,D3")
     a = ap.parse_args()
+    only = set((a.only or "D1,D2,D3,D4,D5").upper().split(","))
     version = {}
     exec(open(os.path.join(REPO, "core", "version.py")).read(), version)
     VERSION = version["VERSION"]
 
-    print("\n[D1] ZIP 本身")
+    print("\n[D1] ZIP 本身（解压总是要做，后面的检查都依赖它）")
     sha = hashlib.sha256(open(a.zip, "rb").read()).hexdigest()
     print("     SHA-256", sha)
     root = tempfile.mkdtemp(prefix="交付 检查 ")
@@ -128,6 +130,18 @@ def main():
     check(all(os.path.exists(os.path.join(res, "core", f.split(".")[0] + ".py")) for f in pycs),
           "每个 .pyc 都有对应的 .py 源码可回退")
 
+    if "D2" in only:
+        d2(app)
+    if a.py39 and "D3" in only:
+        d3(app, res, a.py39, VERSION)
+    if "D4" in only:
+        d4(app, a.py39)
+    if "D5" in only:
+        d5(app, a.old14, a.old150, VERSION)
+    return finish()
+
+
+def d2(app):
     print("\n[D2] Finder 式最小环境、中文空格路径：找不到可用 Python 时")
     home = finder_home(py=None)
     p = launch_like_finder(app, home, {"APKMGR_PYTHON": "/nonexistent"})
@@ -144,9 +158,12 @@ def main():
               "没有 Homebrew / python.org / pyenv 的 Python，且没有 xcode-select 时：不盲目执行 /usr/bin/python3，"
               "记日志并退出（rc=%s）" % rc)
 
-    if a.py39:
+
+
+def d3(app, res, py39, VERSION):
+    if True:
         print("\n[D3] Finder 式最小环境、中文空格路径、只读 Resources、Python 3.9")
-        home = finder_home(py=a.py39)
+        home = finder_home(py=py39)
         logf = os.path.join(home, "Library", "Logs", "APK安装管家.log")
         for d, _, fs in os.walk(res):                 # 模拟装进 /Applications 后不可写
             os.chmod(d, 0o555)
@@ -183,8 +200,11 @@ def main():
         for d, _, fs in os.walk(res):
             os.chmod(d, 0o755)
 
+
+
+def d4(app, py39):
     print("\n[D4] 安装中强制退出：退出前把当前项记为待核验，下次启动先核验")
-    home = finder_home(py=a.py39 or sys.executable)
+    home = finder_home(py=py39 or sys.executable)
     open(os.path.join(home, "dev", ".install_delay"), "w").write("4")
     p = launch_like_finder(app, home)
     port = wait_port(home)
@@ -215,7 +235,10 @@ def main():
           "下次启动后自动核验：%s / %s" % (it["status"], it["code"]))
     http(port, "/api/quit", {"force": True}); p.wait(10)
 
-    for label, old in (("v1.4", a.old14), ("v1.5.0", a.old150)):
+
+
+def d5(app, old14, old150, VERSION):
+    for label, old in (("v1.4", old14), ("v1.5.0", old150)):
         if not old:
             continue
         print("\n[D5] 从 %s 升级：队列、顺序、方案、设置保留" % label)
@@ -250,12 +273,16 @@ def main():
         check(after.get("version") == VERSION, "升级后界面版本 %s" % after.get("version"))
         http(nport, "/api/quit", {"force": True}); p.wait(10)
 
+
+
+def finish():
     ok = sum(1 for r in RESULTS if r[0])
     print("\n===== 交付检查 %d / %d 项通过 =====" % (ok, len(RESULTS)))
     for good, msg in RESULTS:
         if not good:
             print("未通过：", msg)
+    return 0 if RESULTS and ok == len(RESULTS) else 1      # 有任何一项失败，退出码非零
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

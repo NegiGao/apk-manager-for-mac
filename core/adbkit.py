@@ -107,6 +107,14 @@ class AdbError(Exception):
     pass
 
 
+class AdbBlocked(Exception):
+    """命令在发起前被「门控」拦下（例如已经暂停）：没有启动任何 adb 进程。"""
+
+    def __init__(self, reason):
+        Exception.__init__(self, reason)
+        self.reason = reason
+
+
 # 这些子命令作用于某一台具体设备，必须带 -s 指定目标，避免设备多于一台时装错机器
 DEVICE_CMDS = {
     "install", "install-multiple", "uninstall", "shell", "exec-out", "pull", "push",
@@ -115,6 +123,24 @@ DEVICE_CMDS = {
 }
 
 _ctx = threading.local()
+
+
+class _Gate(object):
+    """with adb.gated(check): ... —— 这段代码里每条 adb 命令启动前，都在 gate_lock 内调用 check()；
+    返回非空原因就不启动进程，抛 AdbBlocked。暂停操作也在 gate_lock 内改标志，
+    所以「暂停」一返回，之后不会再有受门控的命令被启动（已经在跑的那条除外）。"""
+
+    def __init__(self, check):
+        self.check = check
+        self.prev = None
+
+    def __enter__(self):
+        self.prev = getattr(_ctx, "gate", None)
+        _ctx.gate = self.check
+        return self
+
+    def __exit__(self, *a):
+        _ctx.gate = self.prev
 
 
 class _Source(object):
@@ -151,6 +177,7 @@ class Adb(object):
         self.path = path or find_adb()
         self._lock = threading.Lock()
         self._lk = threading.Lock()
+        self.gate_lock = threading.RLock()         # 门控：检查暂停标志 + 启动进程 是一个原子步骤
         self.log = collections.deque(maxlen=400)   # 最近的 adb 命令记录
         self.active = {}                            # 正在执行的 adb 命令 token -> 信息
         self._tok = 0
@@ -164,6 +191,22 @@ class Adb(object):
     @staticmethod
     def source(name):
         return _Source(name)
+
+    @staticmethod
+    def gated(check):
+        return _Gate(check)
+
+    def _spawn(self, cmd, serial, **kw):
+        """在门控下启动进程并登记。返回 (proc, tok)。"""
+        with self.gate_lock:
+            check = getattr(_ctx, "gate", None)
+            if check is not None:
+                why = check()
+                if why:
+                    raise AdbBlocked(why)
+            proc = subprocess.Popen(cmd, **kw)
+            tok = self._begin(proc, cmd, serial)
+        return proc, tok
 
     def _base(self, serial=None):
         if not self.available:
@@ -218,9 +261,8 @@ class Adb(object):
         self._check_scope(args, serial)
         cmd = self._base(serial) + args
         t0 = time.time()
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc, tok = self._spawn(cmd, serial, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
-        tok = self._begin(proc, cmd, serial)
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -243,9 +285,8 @@ class Adb(object):
         self._check_scope(args, serial)
         cmd = self._base(serial) + args
         t0 = time.time()
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        proc, tok = self._spawn(cmd, serial, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 bufsize=1, universal_newlines=True, errors="replace")
-        tok = self._begin(proc, cmd, serial)
         if on_proc:
             try:
                 on_proc(proc)
@@ -330,6 +371,8 @@ class Adb(object):
         try:
             code, out, err = self.run(["get-state"], serial=serial, timeout=timeout)
             return (out or err).strip().splitlines()[-1] if (out or err).strip() else ""
+        except AdbBlocked:
+            raise
         except Exception as exc:
             return "error: %s" % exc
 
@@ -339,6 +382,8 @@ class Adb(object):
             code, out, err = self.run(
                 ["shell", "echo __SN__; getprop ro.serialno; getprop ro.boot.serialno; echo __END__"],
                 serial=serial, timeout=timeout)
+        except AdbBlocked:
+            raise
         except Exception as exc:
             return {"state": "error", "err": str(exc)[:200]}
         if "__SN__" not in out or "__END__" not in out:
@@ -374,6 +419,8 @@ class Adb(object):
     def devices(self):
         try:
             code, out, err = self.run(["devices", "-l"], timeout=8)
+        except AdbBlocked:
+            raise
         except Exception as exc:
             raise AdbError(str(exc))
         devs = []
@@ -548,23 +595,47 @@ class Adb(object):
             present  —— 查询成功，设备上有这个包（附版本）
             absent   —— 查询成功，设备上确实没有
             error    —— 查询本身失败（离线、断开、命令出错），结果未知
-        「查询失败」绝不能被当成「没装」。"""
-        cmd = ("echo __BEGIN__; pm path %s; "
-               "dumpsys package %s | grep -m2 -E 'versionCode=|versionName='; "
-               "echo __END__" % (package, package))
+        「查询失败」绝不能被当成「没装」。
+        只有首尾标志完整还不够（pm 服务报错时 echo 照样成功），所以分别取 pm path 与
+        pm list packages 的退出码和输出：
+            present —— pm path 退出码 0 且输出了 package: 行
+            absent  —— pm path 退出码为 0/1 且没有任何输出（真 pm 找不到包时就是退出码 1、无输出），
+                       并且 pm list packages 退出码 0、只输出 package: 行、其中没有这个包（证明服务正常）
+            其他一律 error。"""
+        cmd = ("echo __BEGIN__; pm path {p} 2>&1; echo __PMRC=$?; "
+               "pm list packages {p} 2>&1; echo __LSRC=$?; "
+               "dumpsys package {p} | grep -m2 -E 'versionCode=|versionName='; "
+               "echo __END__").format(p=package)
         try:
             code, out, err = self.run(["shell", cmd], serial=serial, timeout=timeout)
+        except AdbBlocked:
+            raise
         except Exception as exc:
             return {"state": "error", "err": str(exc)[:200]}
-        if "__BEGIN__" not in out or "__END__" not in out:
+        if "__BEGIN__" not in out or "__END__" not in out or "__PMRC=" not in out or "__LSRC=" not in out:
             return {"state": "error", "err": ((err or out).strip().splitlines() or ["?"])[-1][:200]}
         body = out.split("__BEGIN__", 1)[1].split("__END__", 1)[0]
-        if not any(l.strip().startswith("package:") for l in body.splitlines()):
+        path_part, rest = body.split("__PMRC=", 1)
+        pmrc_s, rest = (rest.split("\n", 1) + [""])[:2]
+        list_part, rest = rest.split("__LSRC=", 1)
+        lsrc_s, ver_part = (rest.split("\n", 1) + [""])[:2]
+        try:
+            pmrc, lsrc = int(pmrc_s.strip()), int(lsrc_s.strip())
+        except ValueError:
+            return {"state": "error", "err": "pm 退出码无法解析"}
+        path_lines = [l.strip() for l in path_part.splitlines() if l.strip()]
+        list_lines = [l.strip() for l in list_part.splitlines() if l.strip()]
+        noise = [l for l in path_lines + list_lines if not l.startswith("package:")]
+        if noise:
+            return {"state": "error", "err": noise[0][:200]}
+        if pmrc == 0 and path_lines:
+            vn = re.search(r"versionName=(\S+)", ver_part)
+            vc = re.search(r"versionCode=(\d+)", ver_part)
+            return {"state": "present", "vn": vn.group(1) if vn else None,
+                    "vc": int(vc.group(1)) if vc else None}
+        if pmrc in (0, 1) and not path_lines and lsrc == 0 and "package:" + package not in list_lines:
             return {"state": "absent"}
-        vn = re.search(r"versionName=(\S+)", body)
-        vc = re.search(r"versionCode=(\d+)", body)
-        return {"state": "present", "vn": vn.group(1) if vn else None,
-                "vc": int(vc.group(1)) if vc else None}
+        return {"state": "error", "err": "pm path rc=%s, pm list rc=%s" % (pmrc, lsrc)}
 
     # -- 包枚举 ---------------------------------------------------------
     def list_packages(self, serial, scope="third"):
@@ -594,9 +665,10 @@ class Adb(object):
         present = set()
         code, out, err = self.run(["shell", "pm", "list", "packages"],
                                   serial=serial, timeout=60)
-        if code != 0 or not out.strip():
-            # 设备离线 / 未授权 / 已拔线：必须报错，不能当成「什么都没装」
-            raise AdbError((err or out or "pm list 失败").strip().splitlines()[-1][:160])
+        if code != 0 or not any(l.strip().startswith("package:") for l in out.splitlines()):
+            # 设备离线 / 未授权 / 已拔线 / pm 服务报错：必须报错，不能当成「什么都没装」
+            # （任何一台正常的设备都至少有系统包，一行 package: 都没有就是查询失败）
+            raise AdbError(((err or out or "pm list 失败").strip().splitlines() or ["pm list 失败"])[-1][:160])
         if True:
             for line in out.splitlines():
                 line = line.strip()

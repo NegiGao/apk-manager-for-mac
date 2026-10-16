@@ -36,8 +36,13 @@ no Node, no Xcode. The only external dependency is `adb`, which the app can down
   same phone's Wi-Fi entry or to another device.
 - Success is **verified on the device**: after `Success`, the app re-checks it's still the same device,
   then reads the package back (`pm path` + `dumpsys`). A version mismatch or missing package is
-  *unverified*; if the device can't be queried or its identity can't be confirmed, the item stays
-  **awaiting verification** — a failed query is never reported as "not installed".
+  *unverified*; if the device can't be queried (including Package Manager itself reporting an error)
+  or its identity can't be confirmed, the item stays **awaiting verification**, still tied to the
+  device it was installed on — a failed query is never reported as "not installed", and switching back
+  to the original phone checks it instead of installing it again.
+- If the target's identity can't be confirmed at all (no hardware serial and no reliable connection
+  binding — e.g. a Wi-Fi device that doesn't report one), the queue installs one APK and stops; press
+  Continue for each next one. Another phone could be behind the same address.
 - Save a named order ("new phone setup") and load it again on the next device.
 - Every result is explained: success with version and elapsed time, failures with the actual
   reason *and* what to do about it (signature clash → uninstall first; device has a newer
@@ -82,8 +87,10 @@ no Node, no Xcode. The only external dependency is `adb`, which the app can down
 to finish, but it isn't queried afterwards (it's marked *awaiting verification*, with adb's exit code
 and output kept) and the next one doesn't start. **Resume** verifies pending items first and never
 continues installing by itself; pending items are never reinstalled just because their result was
-unknown. **Cancel current** signals only this app's own `adb install` process (by PID) and then reads
-the device; if that read fails, the result is shown as unknown rather than "cancelled, not installed".
+unknown. Once Pause returns, no new adb command is started for the queue or for verification, and a
+result that comes back after the pause isn't written. **Cancel current** signals only this app's own
+`adb install` process (by PID) and then reads the device; if that read fails, the result is shown as
+unknown rather than "cancelled, not installed".
 
 All automatic adb activity runs on **one scheduler thread** in the backend, so refreshing the page,
 opening a second window or clicking Resume repeatedly never starts a second loop. Pausing is held by
@@ -115,8 +122,10 @@ alert if none is usable. Not yet verified on a real Mac — see [the acceptance 
 and `tools/mac_diagnose.sh` (read-only diagnostics).
 
 Only one copy runs at a time (a lock file decides; double-clicking again just re-opens the window).
-If an older version is still running and idle, it is asked to quit and the new one takes over; if
-it's busy installing, it's left alone.
+If an older version is still running and reports that it's idle, it is asked to quit and the new one
+takes over. If it's busy (installing, loading an app list or extracting APKs) — or it's a version
+before 1.5.2, which can't report extraction — it's left running, and on macOS a note asks you to
+quit it yourself. Closing the window and Quit both wait while any of those is in progress.
 
 ### Phone setup (once)
 
@@ -189,11 +198,13 @@ interrupted mid-way, and an install that reports `Success` without actually land
 
 ```bash
 sh tests/get_test_apks.sh        # once: fetches 3 real open-source APKs into tests/apks/
-python3 tests/acceptance.py      # all 16 scenarios (≈8 min)
+python3 tests/acceptance.py      # all 22 scenarios (≈10 min)
 python3 tests/acceptance.py 10 13  # just some of them
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # run the app under 3.9
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # keep adb command logs
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.1.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.2.zip --py39 /path/to/python3.9
+python3 tests/diag_check.py      # the diagnostics script only ever runs `adb version`
+APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # same tests against old code
 ```
 
 `acceptance.py` covers: pausing the wireless background during a USB install; pausing during failing
@@ -203,7 +214,10 @@ other adb users alone; verifying installs on the device; the queue's pause bound
 background mid-install (pending verification, no reinstall); late results rejected before they are
 written; verification bound to the same device; cancelling only this app's process; a single
 instance under concurrent launches and old-version upgrades; no adb traffic while paused; and
-"Check once" running exactly once. `delivery_check.py` unpacks the release ZIP into a path with CJK
+"Check once" running exactly once; and (v1.5.2) a pause that lands mid-identity-check or
+mid-verification, a pending item surviving a device swap, Package Manager errors, unconfirmable
+targets, and extraction counted as busy. Races are pinned with barriers in the fake adb (a command can
+be held at an exact point until the test releases it), not by retrying or sleeping. `delivery_check.py` unpacks the release ZIP into a path with CJK
 characters and spaces and launches it with a Finder-like minimal environment, a read-only bundle,
 Python 3.9, a forced quit mid-install, and data from v1.4 / v1.5.0.
 
