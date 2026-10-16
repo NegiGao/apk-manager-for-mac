@@ -72,11 +72,27 @@ def finder_home(py=None):
     return home
 
 
-def launch_like_finder(app, home, extra_env=None):
+def launch_like_finder(app, home, extra_env=None, readonly=None):
+    """readonly：把这个目录真正挂成只读再启动。root 不受 chmod 限制，所以 root 下用
+    「独立挂载命名空间 + 只读 bind mount」；非 root 用 chmod 555 即可。"""
     env = {"HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "zh_CN.UTF-8"}
     env.update(extra_env or {})
-    return subprocess.Popen([os.path.join(app, "Contents", "MacOS", "launcher")], env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd = [os.path.join(app, "Contents", "MacOS", "launcher")]
+    if readonly and os.geteuid() == 0:
+        cmd = ["/usr/bin/unshare", "-m", "/bin/sh", "-c",
+               'mount --bind "$0" "$0" && mount -o remount,ro,bind "$0" "$0" && exec "$1"',
+               readonly, cmd[0]]
+    return subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def readonly_ok(path):
+    """确认在同样的方式下这个目录确实写不进去（防止测试自己骗自己）。"""
+    if os.geteuid() == 0:
+        r = subprocess.run(["/usr/bin/unshare", "-m", "/bin/sh", "-c",
+                            'mount --bind "$0" "$0" && mount -o remount,ro,bind "$0" "$0" && touch "$0/.w"',
+                            path], capture_output=True)
+        return r.returncode != 0 and not os.path.exists(os.path.join(path, ".w"))
+    return not os.access(path, os.W_OK)
 
 
 def main():
@@ -131,9 +147,12 @@ def main():
     if a.py39:
         print("\n[D3] Finder 式最小环境、中文空格路径、只读 Resources、Python 3.9")
         home = finder_home(py=a.py39)
+        logf = os.path.join(home, "Library", "Logs", "APK安装管家.log")
         for d, _, fs in os.walk(res):                 # 模拟装进 /Applications 后不可写
             os.chmod(d, 0o555)
-        p = launch_like_finder(app, home)
+        check(readonly_ok(res), "Resources 目录确实不可写（%s）" % (
+            "root：独立挂载命名空间里的只读 bind mount" if os.geteuid() == 0 else "chmod 555"))
+        p = launch_like_finder(app, home, readonly=res)
         port = wait_port(home)
         check(port, "启动成功，端口 %s" % port)
         if port:
@@ -151,7 +170,7 @@ def main():
                   "日志记录了启动器选中的 Python")
             # 再点一次：只拉起窗口，不起第二个服务
             n0 = len(open(os.path.join(home, "browser.log")).read().splitlines())
-            p2 = launch_like_finder(app, home)
+            p2 = launch_like_finder(app, home, readonly=res)
             p2.wait(15)
             n1 = len(open(os.path.join(home, "browser.log")).read().splitlines())
             check(p2.returncode == 0 and n1 == n0 + 1, "再次双击：重新打开窗口，没有第二个服务")
