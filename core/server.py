@@ -97,8 +97,11 @@ class Handler(BaseHTTPRequestHandler):
         return b"".join(chunks)
 
     def _json_body(self):
+        raw = getattr(self, "_raw", None)
+        if raw is None:
+            raw = self._raw = self._body()
         try:
-            return json.loads(self._body().decode("utf-8") or "{}")
+            return json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return {}
 
@@ -134,7 +137,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 return self._json(E.state())
             if path == "/api/devices":
-                return self._json(E.devices())
+                return self._json(E.devices())          # 缓存，不跑 adb
+            if path == "/api/supervisor":
+                return self._json({"ok": True, "state": E.sup.state()})
+            if path == "/api/supervisor/log":
+                n = int(q.get("n") or 120)
+                return self._json({"ok": True, "log": list(E.adb.log)[-n:]})
             if path == "/api/profiles":
                 return self._json({"ok": True, "profiles": E.profiles()})
             if path == "/api/apps":
@@ -158,6 +166,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, q = self._query()
+        # 先把请求体完整读掉（上传除外，它自己流式读）。HTTP/1.1 长连接上
+        # 如果有接口不读请求体，残留的字节会被拼到下一个请求的开头。
+        self._raw = None
+        if path != "/api/upload":
+            self._raw = self._body()
         E = self._wait_engine()
         try:
             if E is None:
@@ -200,9 +213,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(E.reset_status())
             if path == "/api/install":
                 d = self._json_body()
-                return self._json(E.start_install(d.get("serial"), d.get("ids")))
-            if path == "/api/install/stop":
-                return self._json(E.stop_install())
+                return self._json(E.start_install(d.get("serial"), d.get("ids"), d.get("mode")))
+            if path in ("/api/install/stop", "/api/install/pause"):
+                return self._json(E.pause_after_current())
+            if path == "/api/install/continue":
+                return self._json(E.continue_install(self._json_body().get("rebind")))
+            if path == "/api/install/cancel-current":
+                return self._json(E.cancel_current())
+            if path == "/api/supervisor/pause":
+                return self._json(E.sup.pause_all())
+            if path == "/api/supervisor/resume":
+                return self._json(E.sup.resume_all())
+            if path == "/api/supervisor/pause-wifi":
+                return self._json(E.sup.pause_wifi())
+            if path == "/api/supervisor/resume-wifi":
+                return self._json(E.sup.resume_wifi())
+            if path == "/api/supervisor/usb-only":
+                return self._json(E.sup.set_usb_only(self._json_body().get("serial")))
+            if path == "/api/supervisor/check":
+                return self._json(E.sup.check_once())
+            if path == "/api/supervisor/retry":
+                return self._json(E.sup.retry_wifi(self._json_body().get("target")))
+            if path == "/api/supervisor/select":
+                return self._json(E.sup.select(self._json_body().get("serial")))
             if path == "/api/settings":
                 d = self._json_body()
                 E.settings.update(d or {})
@@ -224,6 +257,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(E.stop_app_scan())
             if path == "/api/extract":
                 d = self._json_body()
+                busy = E.busy_reason(d.get("serial"))
+                if busy:
+                    return self._json({"ok": False, "code": busy})
                 threading.Thread(
                     target=E.extract,
                     args=(d.get("serial"), d.get("packages") or [], d.get("apps")),
@@ -235,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/wireless/connect":
                 return self._json(E.wireless_connect(self._json_body().get("hostPort")))
             if path == "/api/wireless/disconnect":
-                return self._json(E.wireless_disconnect(self._json_body().get("hostPort")))
+                return self._json(E.wireless_disconnect(self._json_body().get("hostPort") or ""))
             if path == "/api/wireless/switch":
                 d = self._json_body()
                 return self._json(E.wireless_switch(d.get("serial"),
@@ -246,6 +282,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(E.mark_installed(self._json_body().get("serial")))
             if path == "/api/uninstall":
                 d = self._json_body()
+                if not d.get("serial"):
+                    return self._json({"ok": False, "code": "need_target"})
+                busy = E.busy_reason(d.get("serial"))
+                if busy:
+                    return self._json({"ok": False, "code": busy})
                 threading.Thread(
                     target=E.uninstall,
                     args=(d.get("serial"), d.get("packages") or [],

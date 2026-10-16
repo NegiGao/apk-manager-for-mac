@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""测试用假 adb。把一个本地目录当成「设备」，并用控制文件模拟各种异常：
+
+  $ROOT/.unplugged          存在 → USB 设备被拔掉
+  $ROOT/.extra_devices      每行 "SERIAL<TAB>state"，额外列出 unauthorized / offline 设备
+  $ROOT/.wireless           已连接的无线地址（每行一个）
+  $ROOT/.wifi_down          存在 → 所有无线 connect 都失败
+  $ROOT/.wifi_phone         内容为物理序号 → 无线地址背后换成了另一台手机
+  $ROOT/.install_delay      安装耗时（秒），用来测试安装中途拔线 / 取消
+  $ROOT/.verify_lie         存在 → 安装报 Success 但设备上实际没写入（测试核验）
+每次调用都追加到 $FAKE_ADB_LOG：  时间戳<TAB>参数
+"""
+import os, re, sys, time, shutil
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+
+ROOT = os.environ.get("FAKE_DEV_ROOT", "/tmp/fakedev")
+LOG = os.environ.get("FAKE_ADB_LOG", "/tmp/fakeadb.log")
+USB = "FAKE1234567890"
+PHYS_A = "PHYS-A"
+
+def ctl(name):
+    return os.path.join(ROOT, name)
+
+def has(name):
+    return os.path.exists(ctl(name))
+
+def read(name, default=""):
+    try:
+        return open(ctl(name)).read().strip()
+    except Exception:
+        return default
+
+def log(args):
+    with open(LOG, "a") as f:
+        f.write("%.3f\t%s\n" % (time.time(), " ".join(args)))
+
+def wireless_list():
+    return [l.strip() for l in read(".wireless").splitlines() if l.strip()]
+
+def wireless_set(lst):
+    os.makedirs(ROOT, exist_ok=True)
+    open(ctl(".wireless"), "w").write("\n".join(lst))
+
+def extra():
+    out = []
+    for l in read(".extra_devices").splitlines():
+        if "\t" in l:
+            s, st = l.split("\t", 1)
+            out.append((s.strip(), st.strip()))
+    return out
+
+def device_states():
+    d = {}
+    if not has(".unplugged"):
+        d[USB] = "device"
+    for w in wireless_list():
+        d[w] = "device"
+    for s, st in extra():
+        d[s] = st
+    return d
+
+def physical(serial):
+    if serial == USB:
+        return PHYS_A
+    if serial in wireless_list():
+        return read(".wifi_phone") or PHYS_A
+    return "PHYS-" + serial
+
+def remote_to_local(p):
+    return os.path.join(ROOT, p.lstrip("/"))
+
+def installed():
+    out = {}
+    base = os.path.join(ROOT, "data/app")
+    if not os.path.isdir(base):
+        return out
+    for d in sorted(os.listdir(base)):
+        full = os.path.join(base, d)
+        if not os.path.isdir(full):
+            continue
+        pkg = d.split("-")[0]
+        paths = ["/data/app/%s/%s" % (d, fn) for fn in sorted(os.listdir(full)) if fn.endswith(".apk")]
+        if paths:
+            out[pkg] = paths
+    return out
+
+def pkg_info(pkg):
+    paths = installed().get(pkg)
+    if not paths:
+        return None
+    from core.apkinfo import read_apk
+    info, _ = read_apk(remote_to_local(paths[0]))
+    return info
+
+def die(msg, rc=1):
+    sys.stderr.write(msg + "\n")
+    sys.exit(rc)
+
+def main():
+    args = sys.argv[1:]
+    log(args)
+    serial = None
+    while args and args[0] == "-s":
+        serial = args[1]; args = args[2:]
+    if not args:
+        return 0
+    cmd = args[0]
+
+    if cmd == "version":
+        print("Android Debug Bridge version 1.0.41\nVersion 35.0.2-fake\nInstalled as %s" % sys.argv[0])
+        return 0
+    if cmd == "start-server":
+        return 0
+    if cmd == "devices":
+        print("List of devices attached")
+        for s, st in device_states().items():
+            extra_s = " product:fake model:Pixel_Test device:fake transport_id:1" if st == "device" else ""
+            print("%s\t%s%s" % (s, st, extra_s))
+        return 0
+    if cmd == "pair":
+        if len(args) > 2 and args[2] == "123456":
+            print("Successfully paired to %s [guid=adb-fake]" % args[1]); return 0
+        print("Failed: wrong pairing code"); return 1
+    if cmd == "connect":
+        addr = args[1] if len(args) > 1 else ""
+        if ":" not in addr:
+            addr += ":5555"
+        if has(".wifi_down") or not addr.startswith("192.168."):
+            print("failed to connect to '%s': Connection refused" % addr); return 1
+        lst = wireless_list()
+        if addr not in lst:
+            lst.append(addr); wireless_set(lst)
+        print("connected to %s" % addr); return 0
+    if cmd == "disconnect":
+        if len(args) < 2:
+            # 真 adb 的无参 disconnect 会断开全部 —— 这里记录下来，测试会断言它从未发生
+            wireless_set([]); print("disconnected everything"); return 0
+        wireless_set([a for a in wireless_list() if a != args[1]])
+        print("disconnected %s" % args[1]); return 0
+
+    # ---- 以下都是设备级命令 ----
+    states = device_states()
+    if serial is None:
+        if len([s for s, st in states.items() if st == "device"]) != 1:
+            die("error: more than one device/emulator")
+        serial = next(s for s, st in states.items() if st == "device")
+    st = states.get(serial)
+    if st is None:
+        die("error: device '%s' not found" % serial)
+    if cmd == "get-state":
+        if st != "device":
+            die("error: device %s" % st)
+        print("device"); return 0
+    if st == "unauthorized":
+        die("error: device unauthorized.\nThis adb server's $ADB_VENDOR_KEYS is not set")
+    if st == "offline":
+        die("error: device offline")
+
+    if cmd == "tcpip":
+        print("restarting in TCP mode port: %s" % (args[1] if len(args) > 1 else "5555")); return 0
+    if cmd == "shell":
+        return do_shell(serial, " ".join(args[1:]))
+    if cmd == "exec-out":
+        return do_exec_out(" ".join(args[1:]))
+    if cmd in ("install", "install-multiple"):
+        return do_install(serial, args[1:])
+    if cmd == "uninstall":
+        pkg = [a for a in args[1:] if not a.startswith("-")][-1]
+        paths = installed().get(pkg)
+        if not paths:
+            print("Failure [DELETE_FAILED_INTERNAL_ERROR: Unknown package: %s]" % pkg); return 1
+        shutil.rmtree(os.path.dirname(remote_to_local(paths[0])), ignore_errors=True)
+        print("Success"); return 0
+    if cmd == "pull":
+        src = remote_to_local(args[1])
+        if not os.path.exists(src):
+            die("adb: error: remote object '%s' does not exist" % args[1])
+        os.makedirs(os.path.dirname(os.path.abspath(args[2])), exist_ok=True)
+        shutil.copyfile(src, args[2])
+        print("%s: 1 file pulled, 0 skipped." % args[1]); return 0
+    return 0
+
+PROPS = {"ro.product.brand": "google", "ro.product.model": "Pixel Test",
+         "ro.build.version.release": "14", "ro.build.version.sdk": "34",
+         "ro.product.cpu.abi": "arm64-v8a"}
+
+def do_shell(serial, cmdline):
+    if 'echo "' in cmdline and "getprop" in cmdline:
+        for k, p in re.findall(r'echo "(\w+)=\$\(getprop ([\w.]+)\)"', cmdline):
+            v = physical(serial) if p == "ro.serialno" else PROPS.get(p, "")
+            print("%s=%s" % (k, v))
+        return 0
+    if cmdline.startswith("getprop ro.serialno"):
+        print(physical(serial)); print(""); return 0
+    if "@@" in cmdline:
+        for part in cmdline.split(";"):
+            part = part.strip()
+            m = re.match(r"echo @@(\S+)", part)
+            if m:
+                print("@@%s" % m.group(1)); continue
+            m = re.match(r"dumpsys package (\S+) \|", part)
+            if m:
+                info = pkg_info(m.group(1))
+                if info:
+                    print("    versionCode=%s minSdk=21" % info.version_code)
+                    print("    versionName=%s" % info.version_name)
+        return 0
+    if cmdline.startswith("dumpsys package"):
+        pkg = cmdline.split()[2]
+        info = pkg_info(pkg)
+        if info:
+            print("    versionCode=%s minSdk=21 targetSdk=33" % info.version_code)
+            print("    versionName=%s" % info.version_name)
+        return 0
+    if cmdline.startswith("ip -f inet addr show wlan0"):
+        print("    inet 192.168.1.9/24 brd 192.168.1.255 scope global wlan0"); return 0
+    if cmdline.startswith("pm list packages"):
+        with_path = "-f" in cmdline.split()
+        for pkg, paths in installed().items():
+            if with_path:
+                for p in paths:
+                    print("package:%s=%s" % (p, pkg))
+            else:
+                print("package:%s" % pkg)
+        if not installed():
+            print("package:android")
+        return 0
+    if cmdline.startswith("pm path"):
+        for p in installed().get(cmdline.split()[-1], []):
+            print("package:%s" % p)
+        return 0
+    m = re.match(r"stat -c %s '(.+)'$", cmdline)
+    if m:
+        p = remote_to_local(m.group(1))
+        if os.path.exists(p):
+            print(os.path.getsize(p)); return 0
+        return 1
+    return 0
+
+def do_exec_out(cmdline):
+    m = re.match(r"tail -c \+(\d+) '(.+?)' \| head -c (\d+)$", cmdline)
+    if m:
+        start, path, length = int(m.group(1)) - 1, remote_to_local(m.group(2)), int(m.group(3))
+        with open(path, "rb") as f:
+            f.seek(start); sys.stdout.buffer.write(f.read(length))
+        return 0
+    return 1
+
+def do_install(serial, rest):
+    files = [a for a in rest if not a.startswith("-")]
+    from core.apkinfo import read_apk
+    info, _ = read_apk(files[0])
+    if not info.package:
+        print("Failure [INSTALL_PARSE_FAILED_MANIFEST_MALFORMED]"); return 1
+    if os.environ.get("FAKE_FAIL_PKG") == info.package:
+        print("Performing Streamed Install")
+        print("adb: failed to install %s: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not match]" % files[0])
+        return 1
+    print("Performing Streamed Install"); sys.stdout.flush()
+    delay = float(read(".install_delay", "0.2") or 0.2)
+    t0 = time.time()
+    while time.time() - t0 < delay:          # 安装途中拔线 → 失败
+        time.sleep(0.05)
+        if serial == USB and has(".unplugged"):
+            print("adb: failed to install: device '%s' not found" % serial); return 1
+    if has(".verify_lie"):
+        print("Success"); return 0
+    dest = os.path.join(ROOT, "data/app", "%s-1" % info.package)
+    shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(dest, exist_ok=True)
+    for f in files:
+        name = "base.apk" if (len(files) == 1 or os.path.basename(f).startswith("base")) else os.path.basename(f)
+        shutil.copyfile(f, os.path.join(dest, name))
+    print("Success"); return 0
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

@@ -13,8 +13,9 @@
 <header class="topbar">
   <div class="brand"><span class="logo">A</span><div><div class="t1" data-i18n="appName"></div><div class="t2" data-i18n="appTag"></div></div></div>
   <div class="device-box">
+    <button id="bgChip" class="bg-chip" type="button"></button>
     <select id="deviceSel"></select>
-    <button id="btnRefresh" class="ghost" data-i18n="refresh"></button>
+    <button id="btnRefresh" class="ghost" data-i18n="cCheck"></button>
     <span id="adbState" class="adb-state"></span>
     <select id="langSel" class="lang-sel" title="Language">
       <option value="zh">中文</option>
@@ -29,6 +30,7 @@
   <button class="tab active" data-tab="queue"><span data-i18n="tabQueue"></span> <span id="queueCount" class="pill">0</span></button>
   <button class="tab" data-tab="apps" data-i18n="tabApps"></button>
   <button class="tab" data-tab="wireless" data-i18n="tabWireless"></button>
+  <button class="tab" data-tab="console" data-i18n="tabConsole"></button>
   <button class="tab" data-tab="settings" data-i18n="tabSettings"></button>
 </nav>
 
@@ -66,11 +68,15 @@
       <button id="btnMark" class="ghost small" data-i18n="mark"></button>
       <button id="btnInstallNew" class="ghost small" data-i18n="installNew"></button>
       <button id="btnClear" class="ghost small danger" data-i18n="clear"></button>
-      <button id="btnStop" class="ghost small hidden" data-i18n="stop"></button>
+      <button id="btnCancelCur" class="ghost small danger hidden" data-i18n="cancelCurrent"></button>
+      <button id="btnPauseAfter" class="ghost small hidden" data-i18n="pauseAfterCurrent"></button>
+      <button id="btnContinue" class="primary hidden"></button>
       <button id="btnInstall" class="primary" data-i18n="install"></button>
     </div>
   </div>
 
+  <div id="jobBanner" class="banner hidden"></div>
+  <div id="staleBanner" class="banner info hidden"></div>
   <div id="wirelessHint" class="banner hidden"></div>
 
   <div id="progressWrap" class="progress-wrap hidden">
@@ -140,7 +146,6 @@
     <div class="dz-row">
       <input id="connAddr" type="text" data-i18n-ph="wConnAddr">
       <button id="btnConnect" class="primary small" data-i18n="wConnect"></button>
-      <button id="btnDisconnectAll" class="ghost small danger" data-i18n="wDisconnectAll"></button>
     </div>
     <div id="wHistoryBox" class="hist-box"></div>
   </div>
@@ -149,6 +154,51 @@
     <h3 data-i18n="wStep3"></h3>
     <p class="muted" data-i18n="wStep3Tip"></p>
     <button id="btnSwitchWifi" class="primary small" data-i18n="wSwitch"></button>
+  </div>
+</section>
+
+<!-- ============ ADB 控制台 ============ -->
+<section class="page" id="page-console">
+  <div class="card console-ctl">
+    <div class="ctl-row">
+      <button id="cCheck" class="primary small" data-i18n="cCheck"></button>
+      <button id="cPauseAll" class="ghost small"></button>
+      <button id="cPauseWifi" class="ghost small"></button>
+      <span class="sep"></span>
+      <label class="lbl" data-i18n="cUsbOnly"></label>
+      <select id="cUsbOnlySel"></select>
+    </div>
+    <div id="cSummary" class="ctl-summary"></div>
+    <div id="cUsbOnlyNote" class="muted small-note"></div>
+  </div>
+
+  <div class="console-grid">
+    <div class="card">
+      <h3 data-i18n="cSecServer"></h3>
+      <div id="cServer"></div>
+    </div>
+    <div class="card">
+      <h3 data-i18n="cSecDevices"></h3>
+      <div id="cDevices"></div>
+    </div>
+    <div class="card">
+      <h3 data-i18n="cSecTasks"></h3>
+      <div id="cTasks"></div>
+      <div id="cReconnect"></div>
+    </div>
+    <div class="card">
+      <h3 data-i18n="cSecInstall"></h3>
+      <div id="cInstall"></div>
+    </div>
+    <div class="card span2">
+      <h3 data-i18n="cSecRecent"></h3>
+      <div id="cRecent"></div>
+      <div id="cActive"></div>
+      <details id="cLogBox" class="logbox">
+        <summary data-i18n="cRawLog"></summary>
+        <div id="cLog" class="cmdlog"></div>
+      </details>
+    </div>
   </div>
 </section>
 
@@ -195,7 +245,7 @@
 </section>
 
 <div id="toasts"></div>
-<div id="modal" class="modal hidden"><div class="modal-box"><h3 id="modalTitle"></h3><div id="modalBody"></div><div class="modal-foot"><button id="modalOk" class="primary small">OK</button></div></div></div>
+<div id="modal" class="modal hidden"><div class="modal-box"><h3 id="modalTitle"></h3><div id="modalBody"></div><div class="modal-foot" id="modalFoot"><button id="modalOk" class="primary small">OK</button></div></div></div>
 
 <script src="/static/i18n.js"></script>
 <script src="/static/app.js"></script>

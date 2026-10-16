@@ -8,7 +8,12 @@ const api = async (path, body, method) => {
   return r.json();
 };
 
-const S = { items: [], devices: [], settings: {}, apps: [], selected: new Set(), scanning: false };
+/* 设备列表、后台任务状态全部来自后端的统一管理器（经 SSE 推送）。
+   前端不再自己定时轮询 adb —— 开几个窗口、刷新几次页面，后台都只有一份任务。 */
+const S = {
+  items: [], devices: [], settings: {}, apps: [], selected: new Set(), scanning: false,
+  sup: null, job: null, tab: "queue",
+};
 
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c =>
@@ -19,6 +24,24 @@ function fmtSize(n) {
   const u = ["B", "KB", "MB", "GB"]; let i = 0, f = n;
   while (f >= 1024 && i < 3) { f /= 1024; i++; }
   return (i === 0 ? f.toFixed(0) : f.toFixed(1)) + " " + u[i];
+}
+function fmtTime(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+}
+function fmtAgo(ts) {
+  if (!ts) return "—";
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (s < 60) return t("agoSec", { n: s });
+  if (s < 3600) return t("agoMin", { n: Math.round(s / 60) });
+  return fmtTime(ts);
+}
+/* 后端返回的错误代码 → 当前语言的说明 */
+function errText(r) {
+  if (!r) return "";
+  if (r.code && I18N.zh["e_" + r.code] !== undefined) return t("e_" + r.code, { v: r.arg || "" });
+  return r.error || r.message || r.code || "";
 }
 
 /* ---------------- 提示 ---------------- */
@@ -32,12 +55,32 @@ function toast(title, body, kind) {
   setTimeout(() => { el.style.opacity = "0"; el.style.transition = ".4s"; }, 5200);
   setTimeout(() => el.remove(), 5700);
 }
+function closeModal() { $("#modal").classList.add("hidden"); }
 function modal(title, html) {
   $("#modalTitle").textContent = title;
   $("#modalBody").innerHTML = html;
+  $("#modalFoot").innerHTML = `<button class="primary small" id="modalOk">OK</button>`;
+  $("#modalOk").onclick = closeModal;
   $("#modal").classList.remove("hidden");
 }
-$("#modalOk").onclick = () => $("#modal").classList.add("hidden");
+/* 多按钮弹窗，返回所点按钮的 key（取消为 null） */
+function modalChoice(title, html, buttons) {
+  return new Promise(resolve => {
+    $("#modalTitle").textContent = title;
+    $("#modalBody").innerHTML = html;
+    const foot = $("#modalFoot");
+    foot.innerHTML = "";
+    buttons.forEach(b => {
+      const el = document.createElement("button");
+      el.className = (b.primary ? "primary" : "ghost") + " small" + (b.danger ? " danger" : "");
+      el.textContent = b.label;
+      el.disabled = !!b.disabled;
+      el.onclick = () => { closeModal(); resolve(b.key); };
+      foot.appendChild(el);
+    });
+    $("#modal").classList.remove("hidden");
+  });
+}
 
 /* ---------------- 语言 ---------------- */
 function applyLang(code) {
@@ -47,10 +90,10 @@ function applyLang(code) {
   $("#sortDir").textContent = t($("#sortDir").dataset.desc === "1" ? "desc" : "asc");
   const ph = $("#profileSel") && $("#profileSel").querySelector('option[value=""]');
   if (ph) ph.textContent = t("profilePlaceholder");
+  $("#btnRefresh").textContent = t("cCheck");
   renderQueue();
   renderApps();
-  renderWireless();
-  refreshDeviceSelect();
+  renderSupAll();
   const ok = S.settings && S.settings.__adbOk;
   $("#adbState").textContent = ok === undefined ? "" : t(ok ? "adbReady" : "adbMissing");
 }
@@ -62,12 +105,14 @@ $("#langSel").onchange = async () => {
 };
 
 /* ---------------- 标签页 ---------------- */
-$$(".tab").forEach(tab => tab.onclick = () => {
-  $$(".tab").forEach(x => x.classList.remove("active"));
-  $$(".page").forEach(x => x.classList.remove("active"));
-  tab.classList.add("active");
-  $("#page-" + tab.dataset.tab).classList.add("active");
-});
+function showTab(name) {
+  S.tab = name;
+  $$(".tab").forEach(x => x.classList.toggle("active", x.dataset.tab === name));
+  $$(".page").forEach(x => x.classList.toggle("active", x.id === "page-" + name));
+  if (name === "console") { renderConsole(); loadCmdLog(); }
+}
+$$(".tab").forEach(tab => tab.onclick = () => showTab(tab.dataset.tab));
+$("#bgChip").onclick = () => showTab("console");
 
 /* ---------------- 队列 ---------------- */
 function letterIcon(name) {
@@ -82,6 +127,8 @@ function statusText(it) {
   if (it.status === "success") return "✓ " + txt;
   if (it.status === "skipped") return "– " + txt;
   if (it.status === "failed") return "✕ " + txt;
+  if (it.status === "unverified") return "⚠ " + txt;
+  if (it.status === "cancelled" || it.status === "cancel_installed") return "■ " + txt;
   return it.status || "";
 }
 function installedTag(ins) {
@@ -111,7 +158,8 @@ function renderQueue() {
     if (it.duplicate) tags.push(`<span class="tag warn">${escapeHtml(t("tagDup"))}</span>`);
     if (it.error) tags.push(`<span class="tag warn">${escapeHtml(it.error)}</span>`);
     if (it.minSdk) tags.push(`<span class="tag">${escapeHtml(t("tagMinSdk", { n: it.minSdk }))}</span>`);
-    const hint = it.status === "failed" ? codeHint(it.code) : "";
+    const hint = (it.status === "failed" || it.status === "unverified" || it.status === "cancelled")
+      ? codeHint(it.code) : "";
     const installed = it.installed && it.installed.state && it.installed.state !== "none";
     li.innerHTML = `
       <span class="handle">⠿</span>
@@ -332,6 +380,7 @@ $("#btnProfDel").onclick = async () => {
 };
 $("#btnClear").onclick = async () => {
   if (!S.items.length) return;
+  if ((S.job || {}).running) { toast(t("tCantStart"), t("e_busy_install"), "warn"); return; }
   if (!confirm(t("tConfirmClear"))) return;
   await api("/api/queue/clear", {});
   refreshState();
@@ -341,19 +390,65 @@ $("#btnClear").onclick = async () => {
 function currentDevice() {
   return S.devices.find(d => d.serial === $("#deviceSel").value);
 }
-$("#btnInstall").onclick = async () => {
+async function startInstall(mode, ids) {
   const serial = $("#deviceSel").value;
   if (!serial) { toast(t("tNoDevice"), t("tNoDeviceSub"), "warn"); return; }
   if (!S.items.length) { toast(t("tQueueEmpty"), t("tQueueEmptySub"), "warn"); return; }
-  await api("/api/queue/reset", {});
-  const r = await api("/api/install", { serial });
-  if (!r.ok) { toast(t("tCantStart"), r.error || "", "err"); return; }
-  $("#log").textContent = "";
-  $("#logBox").open = true;
+  const r = await api("/api/install", { serial, mode: mode || null, ids: ids || null });
+  if (r.ok) {
+    $("#log").textContent = "";
+    $("#logBox").open = true;
+    return;
+  }
+  if (r.code === "choose_mode") {
+    // 这台设备上已经装成功过一部分：不盲目从头重装
+    const c = await modalChoice(t("chooseTitle"),
+      `<p>${escapeHtml(t("chooseBody", { d: r.done, n: r.remaining }))}</p>`, [
+        { key: "remaining", label: t("chooseRemaining", { n: r.remaining }), primary: true, disabled: !r.remaining },
+        { key: "all", label: t("chooseAll") },
+        { key: null, label: t("cancel") },
+      ]);
+    if (c) return startInstall(c, ids);
+    return;
+  }
+  toast(t("tCantStart"), errText(r), "err");
+}
+$("#btnInstall").onclick = () => startInstall(null);
+$("#btnInstallNew").onclick = () => {
+  const ids = S.items.filter(i => !i.installed ||
+    ["none", "update", "unknown"].includes(i.installed.state)).map(i => i.id);
+  if (!ids.length) { toast(t("tNothingNew"), t("tNothingNewSub"), "warn"); return; }
+  startInstall("all", ids);
 };
-$("#btnStop").onclick = async () => {
-  await api("/api/install/stop", {});
-  toast(t("tStopping"), t("tStoppingSub"), "warn");
+$("#btnPauseAfter").onclick = async () => {
+  const r = await api("/api/install/pause", {});
+  if (r.ok) toast(t("tPauseAfterSet"), t("tPauseAfterSetSub"), "warn");
+  else toast(t("tCantStart"), errText(r), "err");
+};
+$("#btnContinue").onclick = () => continueInstall(null);
+async function continueInstall(rebind) {
+  const r = await api("/api/install/continue", { rebind });
+  if (r.ok) { toast(t("tContinued"), t("tStartInstallSub", { n: r.remaining }), "ok"); return; }
+  if (r.code === "bound_target_lost" || r.code === "bound_target_mismatch") {
+    const cur = currentDevice();
+    const job = S.job || {};
+    const canRebind = cur && cur.state === "device" && cur.serial !== job.serial;
+    const c = await modalChoice(t("reboundTitle"),
+      `<p>${escapeHtml(errText(r))}</p>` +
+      (canRebind ? `<p class="muted">${escapeHtml(t("reboundBody", { a: job.name || job.serial, b: cur.name || cur.serial }))}</p>` : ""),
+      [
+        { key: "rebind", label: t("reboundGo", { b: canRebind ? (cur.name || cur.serial) : "" }), primary: true, disabled: !canRebind },
+        { key: null, label: t("cancel") },
+      ]);
+    if (c === "rebind") return continueInstall(cur.serial);
+    return;
+  }
+  toast(t("tCantStart"), errText(r), "err");
+}
+$("#btnCancelCur").onclick = async () => {
+  if (!confirm(t("cancelWarn"))) return;
+  const r = await api("/api/install/cancel-current", {});
+  if (!r.ok) toast(t("tCantStart"), errText(r), "err");
 };
 $("#btnMark").onclick = async () => {
   const serial = $("#deviceSel").value;
@@ -366,25 +461,39 @@ $("#btnMark").onclick = async () => {
     const c = r.counts || {};
     toast(t("tMarkDone"), t("tMarkMsg", { n: r.count }) +
       (c.update ? t("tMarkUpd", { n: c.update }) : ""), "ok");
-  } else toast(t("tMarkFail"), r.error || "", "err");
-};
-$("#btnInstallNew").onclick = async () => {
-  const serial = $("#deviceSel").value;
-  if (!serial) { toast(t("tNoDevice"), t("tNoDeviceSub"), "warn"); return; }
-  const ids = S.items.filter(i => !i.installed ||
-    ["none", "update", "unknown"].includes(i.installed.state)).map(i => i.id);
-  if (!ids.length) { toast(t("tNothingNew"), t("tNothingNewSub"), "warn"); return; }
-  await api("/api/queue/reset", {});
-  const r = await api("/api/install", { serial, ids });
-  if (!r.ok) { toast(t("tCantStart"), r.error || "", "err"); return; }
-  toast(t("tStartInstall"), t("tStartInstallSub", { n: ids.length }), "ok");
-  $("#log").textContent = ""; $("#logBox").open = true;
+  } else toast(t("tMarkFail"), errText(r), "err");
 };
 $("#btnQuit").onclick = async () => {
   if (!confirm(t("tQuit"))) return;
   await api("/api/quit", {});
   document.body.innerHTML = `<div class="empty" style="padding-top:120px">${escapeHtml(t("tQuitDone"))}</div>`;
 };
+
+/* 安装按钮组 + 暂停原因横幅 */
+function renderJobControls() {
+  const j = S.job || {};
+  const running = !!j.running;
+  const paused = !!j.paused && (j.remaining || 0) > 0;
+  $("#btnInstall").classList.toggle("hidden", running);
+  $("#btnPauseAfter").classList.toggle("hidden", !running);
+  $("#btnCancelCur").classList.toggle("hidden", !running || !j.current);
+  $("#btnPauseAfter").disabled = !!j.pauseAfterCurrent;
+  $("#btnPauseAfter").textContent = t(j.pauseAfterCurrent ? "pauseAfterSet" : "pauseAfterCurrent");
+  $("#btnContinue").classList.toggle("hidden", running || !paused);
+  $("#btnContinue").textContent = t("continueN", { n: j.remaining || 0 });
+  $("#btnInstall").classList.toggle("ghost", paused);
+  $("#btnInstall").classList.toggle("primary", !paused);
+  const b = $("#jobBanner");
+  if (paused) {
+    b.textContent = t("jp_" + (j.pauseReason || "user"), { d: j.name || j.serial || "", n: j.remaining || 0 });
+    b.className = "banner " + (["target_lost", "target_mismatch"].includes(j.pauseReason) ? "err" : "");
+  } else if (running && j.pauseAfterCurrent) {
+    b.textContent = t("jp_pending", { c: j.currentLabel || "" });
+    b.className = "banner";
+  } else {
+    b.className = "banner hidden";
+  }
+}
 
 /* ---------------- 卸载 ---------------- */
 async function uninstall(pkgs, labels) {
@@ -397,40 +506,55 @@ async function uninstall(pkgs, labels) {
     : t("tConfirmUnN", { n: pkgs.length }) + "\n\n" + names.slice(0, 12).join("\n") +
       (pkgs.length > 12 ? "\n…" : "");
   if (!confirm(tip + "\n\n" + (keep ? t("tKeepNote") : t("tDataNote")))) return;
-  await api("/api/uninstall", { serial, packages: pkgs, labels: labels || {}, keepData: keep });
+  const r = await api("/api/uninstall", { serial, packages: pkgs, labels: labels || {}, keepData: keep });
+  if (!r.ok) { toast(t("tUninstallFail"), errText(r), "err"); return; }
   toast(t("tUninstallStart"), String(pkgs.length), "warn");
 }
 
-/* ---------------- 设备 ---------------- */
-let lastMarkedSerial = null;
+/* ---------------- 设备（来自统一管理器的缓存，不触发 adb） ---------------- */
+function stateText(d) {
+  if (d.state === "device") return t("dsOnline");
+  if (d.state === "unauthorized") return t("dsUnauthorized");
+  if (d.state === "offline") return t("dsOffline");
+  return d.state;
+}
 function deviceLabel(d) {
   const tag = d.wireless ? t("wTagWiFi") : t("wTagUSB");
-  let sub;
-  if (d.stateCode === "ok") sub = `Android ${d.android || "?"} · ${d.abi || "?"}`;
-  else if (d.stateCode === "unauthorized") sub = t("sUnauthorized");
-  else if (d.stateCode === "offline") sub = t("sOffline");
-  else sub = d.state;
-  return `[${tag}] ${d.name || d.serial} — ${sub}`;
+  const sub = d.state === "device"
+    ? (d.android ? `Android ${d.android} · ${d.abi || "?"}` : t("dsOnline"))
+    : stateText(d);
+  const peer = d.duplicate ? " · " + t("dSameAs") : "";
+  return `[${tag}] ${d.name || d.serial} — ${sub}${peer}`;
 }
 function refreshDeviceSelect() {
   const sel = $("#deviceSel");
   if (!sel) return;
-  const old = sel.value;
+  const sup = S.sup || {};
   sel.innerHTML = "";
   if (!S.devices.length) {
     sel.innerHTML = `<option value="">${escapeHtml(t("noDevice"))}</option>`;
     return;
   }
+  const uo = sup.usbOnly;
   S.devices.forEach(d => {
     const o = document.createElement("option");
     o.value = d.state === "device" ? d.serial : "";
-    o.textContent = deviceLabel(d);
-    o.disabled = d.state !== "device";
+    o.textContent = (sup.stale ? "⏸ " : "") + deviceLabel(d);
+    o.disabled = d.state !== "device" || (uo && d.serial !== uo.serial);
     sel.appendChild(o);
   });
-  const usable = S.devices.filter(d => d.state === "device");
-  if (old && usable.some(d => d.serial === old)) sel.value = old;
-  else if (usable.length) sel.value = usable[0].serial;
+  const usable = S.devices.filter(d => d.state === "device" && (!uo || d.serial === uo.serial));
+  if (sup.selected && S.devices.some(d => d.serial === sup.selected && d.state === "device")) {
+    sel.value = sup.selected;
+  } else if (!sup.selected && usable.length) {
+    sel.value = usable[0].serial;
+    api("/api/supervisor/select", { serial: usable[0].serial });   // 只在还没选时自动选第一台
+  } else if (sup.selected) {
+    // 选中的设备不见了：保持空，不自动换成别的设备
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = t("dSelectedGone"); o.selected = true;
+    sel.insertBefore(o, sel.firstChild);
+  }
   updateWirelessHint();
 }
 function updateWirelessHint() {
@@ -445,36 +569,260 @@ function updateWirelessHint() {
     box.classList.remove("hidden");
   } else box.classList.add("hidden");
 }
-async function refreshDevices() {
-  const r = await api("/api/devices");
-  if (r.booting) { setTimeout(refreshDevices, 400); return r; }
-  S.devices = r.devices || [];
+$("#btnRefresh").onclick = () => checkOnce();
+async function checkOnce() {
+  $("#btnRefresh").disabled = true; $("#cCheck").disabled = true;
+  const r = await api("/api/supervisor/check", {});
+  $("#btnRefresh").disabled = false; $("#cCheck").disabled = false;
+  if (r.ok) {
+    const n = S.devices.filter(d => d.state === "device").length;
+    toast(t("tDevDone"), n ? t("tDevFound", { n }) : t("tDevNone"), n ? "ok" : "warn");
+  } else toast(t("tCheckFail"), errText(r), "err");
+}
+$("#deviceSel").onchange = async () => {
+  const serial = $("#deviceSel").value;
+  const r = await api("/api/supervisor/select", { serial: serial || null });
+  if (!r.ok) { toast(t("tCantStart"), errText(r), "warn"); refreshDeviceSelect(); }
+  updateWirelessHint();
+};
+
+/* 后台状态：顶栏标签 + 队列页横幅 */
+function renderChip() {
+  const sup = S.sup;
+  const chip = $("#bgChip");
+  if (!sup) { chip.textContent = ""; return; }
+  const disc = sup.tasks.discovery;
+  let text, cls;
+  if (sup.bgPaused) { text = t("chipPaused"); cls = "warn"; }
+  else if (disc.state === "waiting") { text = t("chipFailWait"); cls = "err"; }
+  else { text = t("chipRunning"); cls = "ok"; }
+  const extra = [];
+  if (!sup.bgPaused && sup.wifiPaused) extra.push(t("chipWifiPaused"));
+  if (sup.usbOnly) extra.push(t("chipUsbOnly"));
+  chip.textContent = text + (extra.length ? " · " + extra.join(" · ") : "");
+  chip.className = "bg-chip " + cls;
+  chip.title = t("cLastCheck") + " " + fmtTime(sup.devicesAt);
+}
+function renderStale() {
+  const sup = S.sup;
+  const b = $("#staleBanner");
+  if (!sup) { b.classList.add("hidden"); return; }
+  const disc = sup.tasks.discovery;
+  if (sup.bgPaused) {
+    b.innerHTML = `${escapeHtml(t("staleBanner", { at: fmtTime(sup.devicesAt) }))}
+      <button class="ghost small" data-act="resume">${escapeHtml(t("cResumeAll"))}</button>
+      <button class="ghost small" data-act="check">${escapeHtml(t("cCheck"))}</button>`;
+    b.classList.remove("hidden");
+  } else if (disc.state === "waiting") {
+    b.innerHTML = `${escapeHtml(t("failWaitBanner", { at: fmtTime(disc.lastOk) }))}
+      <button class="ghost small" data-act="check">${escapeHtml(t("cCheck"))}</button>`;
+    b.classList.remove("hidden");
+  } else {
+    b.classList.add("hidden");
+    return;
+  }
+  b.querySelectorAll("button").forEach(x => x.onclick = () =>
+    x.dataset.act === "resume" ? supAct("/api/supervisor/resume") : checkOnce());
+}
+function renderSupAll() {
   refreshDeviceSelect();
   renderWireless();
-  const sel = $("#deviceSel");
-  if (sel.value !== lastMarkedSerial) {
-    lastMarkedSerial = sel.value;
-    if (S.settings.autoMark !== false) {
-      api("/api/mark", { serial: sel.value || null }).then(() => refreshState());
-    }
+  renderChip();
+  renderStale();
+  renderJobControls();
+  if (S.tab === "console") renderConsole();
+}
+function applySup(st) {
+  if (!st) return;
+  S.sup = st;
+  S.devices = st.devices || [];
+  if (st.install && Object.keys(st.install).length && st.install.serial !== undefined) {
+    S.job = Object.assign({}, S.job || {}, st.install);
   }
+  renderSupAll();
+}
+async function loadSup() {
+  const r = await api("/api/supervisor");
+  if (r.booting) { setTimeout(loadSup, 300); return; }
+  applySup(r.state);
+}
+async function supAct(path, body) {
+  const r = await api(path, body || {});
+  if (!r.ok) toast(t("tCantStart"), errText(r), "err");
   return r;
 }
-$("#btnRefresh").onclick = async () => {
-  $("#btnRefresh").disabled = true;
-  const r = await refreshDevices();
-  $("#btnRefresh").disabled = false;
-  const n = (r.devices || []).filter(d => d.state === "device").length;
-  toast(t("tDevDone"), n ? t("tDevFound", { n }) : t("tDevNone"), n ? "ok" : "warn");
-};
-$("#deviceSel").onchange = async () => {
-  lastMarkedSerial = $("#deviceSel").value;
-  updateWirelessHint();
-  if (S.settings.autoMark !== false) {
-    await api("/api/mark", { serial: lastMarkedSerial || null });
-    refreshState();
+
+/* ---------------- ADB 控制台 ---------------- */
+const TASK_KEYS = ["discovery", "status", "wifi_connect", "wifi_reconnect"];
+function badge(state) {
+  return `<span class="badge b-${state}">${escapeHtml(t("ts_" + state))}</span>`;
+}
+function renderConsole() {
+  const sup = S.sup;
+  if (!sup) return;
+  // 控制按钮
+  $("#cPauseAll").textContent = t(sup.bgPaused ? "cResumeAll" : "cPauseAll");
+  $("#cPauseAll").className = "small " + (sup.bgPaused ? "primary" : "ghost");
+  $("#cPauseWifi").textContent = t(sup.wifiPaused ? "cResumeWifi" : "cPauseWifi");
+  $("#cPauseWifi").className = "small " + (sup.wifiPaused ? "primary" : "ghost");
+  $("#cPauseWifi").disabled = sup.bgPaused;
+  const uoSel = $("#cUsbOnlySel");
+  const uo = sup.usbOnly;
+  uoSel.innerHTML = `<option value="">${escapeHtml(t("cUsbOff"))}</option>` +
+    S.devices.filter(d => !d.wireless && d.state === "device")
+      .map(d => `<option value="${escapeHtml(d.serial)}">${escapeHtml(d.name || d.serial)} (${escapeHtml(d.serial)})</option>`).join("");
+  if (uo && !uoSel.querySelector(`option[value="${CSS.escape(uo.serial)}"]`)) {
+    uoSel.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(uo.serial)}">${escapeHtml(uo.name)} — ${escapeHtml(t("dsGone"))}</option>`);
   }
+  uoSel.value = uo ? uo.serial : "";
+  uoSel.disabled = !!(S.job || {}).running;
+  $("#cUsbOnlyNote").textContent = uo ? t("cUsbOnlyOn", { d: uo.name }) : t("cUsbOnlyOffNote");
+
+  let sum;
+  if (sup.bgPaused) sum = t("sumPaused", { at: fmtTime(sup.devicesAt) });
+  else if (sup.tasks.discovery.state === "waiting") sum = t("sumFailWait");
+  else sum = t("sumRunning", { at: fmtTime(sup.devicesAt) });
+  if (sup.wifiPaused && !sup.bgPaused) sum += " " + t("sumWifiPaused");
+  $("#cSummary").textContent = sum;
+  $("#cSummary").className = "ctl-summary " + (sup.bgPaused ? "warn" : "");
+
+  // ADB 服务
+  const sv = sup.server;
+  if (!sv) {
+    $("#cServer").innerHTML = `<p class="muted">${escapeHtml(t("cNoServerInfo"))}</p>`;
+  } else {
+    const procs = (sv.processes || []).map(p => `
+      <tr><td>${p.pid}</td><td>${escapeHtml(t("po_" + p.owner))}</td><td class="mono">${escapeHtml(p.args)}</td></tr>`).join("");
+    $("#cServer").innerHTML = `
+      <div class="kv"><span>${escapeHtml(t("cAdbPath"))}</span><b class="mono">${escapeHtml(sv.path || "—")}</b></div>
+      <div class="kv"><span>${escapeHtml(t("cAdbVer"))}</span><b>${escapeHtml(sv.version || "—")}</b></div>
+      <div class="kv"><span>${escapeHtml(t("cAdbPort"))}</span><b>${sv.port} · ${escapeHtml(t(sv.listening ? "cListening" : "cNotListening"))}</b></div>
+      ${procs ? `<table class="tbl"><tr><th>PID</th><th>${escapeHtml(t("cOwner"))}</th><th>${escapeHtml(t("cCmd"))}</th></tr>${procs}</table>`
+              : `<p class="muted">${escapeHtml(t("cNoProc"))}</p>`}
+      <p class="muted small-note">${escapeHtml(t("cServerNote"))}</p>
+      <p class="muted small-note">${escapeHtml(t("cMdnsNote"))}</p>
+      ${sup.bgPaused ? `<p class="muted small-note">${escapeHtml(t("cServerStale", { at: fmtTime(sup.devicesAt) }))}</p>` : ""}`;
+  }
+
+  // 设备连接（按核验过的物理序号合并）
+  const groups = {};
+  S.devices.forEach(d => { const k = d.physical || ("~" + d.serial); (groups[k] = groups[k] || []).push(d); });
+  const gHtml = Object.keys(groups).map(k => {
+    const list = groups[k];
+    const head = list[0];
+    const verified = !k.startsWith("~");
+    const rows = list.map(d => `
+      <div class="conn">
+        <span class="tag ${d.wireless ? "tag-wifi" : "tag-usb"}">${escapeHtml(d.wireless ? t("wTagWiFi") : t("wTagUSB"))}</span>
+        <span class="mono">${escapeHtml(d.serial)}</span>
+        <span class="ds ds-${d.state}">${escapeHtml(stateText(d))}</span>
+        ${d.detailPaused ? `<span class="muted">${escapeHtml(t("dDetailPaused"))}</span>` : ""}
+        ${d.wireless ? `<button class="ghost small danger" data-dis="${escapeHtml(d.serial)}">${escapeHtml(t("cDisconnectThis"))}</button>` : ""}
+      </div>`).join("");
+    return `<div class="dgroup">
+        <div class="dhead"><b>${escapeHtml(head.name || head.serial)}</b>
+          <span class="muted">${escapeHtml(verified ? t("dPhysical", { s: k }) : t("dPhysicalUnknown"))}</span>
+          ${list.length > 1 ? `<span class="tag">${escapeHtml(t("dMerged", { n: list.length }))}</span>` : ""}
+        </div>${rows}</div>`;
+  }).join("");
+  $("#cDevices").innerHTML = (gHtml || `<p class="muted">${escapeHtml(t("noDevice"))}</p>`) +
+    (sup.stale ? `<p class="muted small-note">${escapeHtml(t("cStaleNote", { at: fmtTime(sup.devicesAt) }))}</p>` : "");
+  $$("#cDevices [data-dis]").forEach(b => b.onclick = async () => {
+    const target = b.dataset.dis;
+    if (!confirm(t("cDisconnectConfirm", { t: target }))) return;
+    const r = await supAct("/api/wireless/disconnect", { hostPort: target });
+    if (r.ok) toast(t("wDisconnected"), target, "ok");
+  });
+
+  // 后台任务
+  const now = Date.now() / 1000;
+  const rows = TASK_KEYS.map(k => {
+    const tk = sup.tasks[k];
+    const next = tk.next && tk.state === "idle" && !sup.bgPaused
+      ? t("cNextIn", { n: Math.max(0, Math.round(tk.next - now)) }) : "—";
+    const note = tk.note ? t("tn_" + tk.note) : (tk.lastError ? tk.lastError : "");
+    return `<tr><td>${escapeHtml(t("tk_" + k))}</td><td>${badge(tk.state)}</td>
+      <td>${escapeHtml(fmtTime(tk.lastOk))}</td><td>${escapeHtml(next)}</td>
+      <td class="muted">${escapeHtml(note)}</td></tr>`;
+  }).join("");
+  $("#cTasks").innerHTML = `<table class="tbl"><tr><th>${escapeHtml(t("cTask"))}</th><th>${escapeHtml(t("cState"))}</th>
+    <th>${escapeHtml(t("cLastOk"))}</th><th>${escapeHtml(t("cNext"))}</th><th>${escapeHtml(t("cNote"))}</th></tr>${rows}</table>
+    <p class="muted small-note">${escapeHtml(t("cNoKeepalive"))}</p>`;
+  const rec = sup.reconnect || [];
+  $("#cReconnect").innerHTML = rec.length ? `<h4>${escapeHtml(t("cReconnectQ"))}</h4>` + rec.map(r => `
+    <div class="conn"><span class="mono">${escapeHtml(r.target)}</span>
+      <span>${escapeHtml(r.gaveUp ? t("rcGaveUp") : r.protected ? t("rcProtected")
+        : t("rcNext", { a: r.attempts, n: Math.max(0, Math.round((r.next || now) - now)) }))}</span>
+      ${r.lastError ? `<span class="muted">${escapeHtml(r.lastError)}</span>` : ""}
+      <button class="ghost small" data-retry="${escapeHtml(r.target)}">${escapeHtml(t("cRetryOnce"))}</button></div>`).join("") : "";
+  $$("#cReconnect [data-retry]").forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    const r = await api("/api/supervisor/retry", { target: b.dataset.retry });
+    b.disabled = false;
+    toast(r.ok ? t("wConnOk", { t: r.target }) : t("wConnFail"), r.ok ? "" : (r.message || errText(r)), r.ok ? "ok" : "err");
+  });
+
+  // 安装任务
+  const j = S.job || {};
+  if (!j.serial) {
+    $("#cInstall").innerHTML = `<p class="muted">${escapeHtml(t("cNoJob"))}</p>`;
+  } else {
+    const state = j.running ? (j.pauseAfterCurrent ? "jsPausing" : "jsRunning")
+      : j.paused ? "jsPaused" : j.finished ? "jsDone" : "jsIdle";
+    $("#cInstall").innerHTML = `
+      <div class="kv"><span>${escapeHtml(t("cBound"))}</span><b>${escapeHtml(j.name || "")} <span class="mono">${escapeHtml(j.serial)}</span></b></div>
+      <div class="kv"><span>${escapeHtml(t("cBoundPhys"))}</span><b class="mono">${escapeHtml(j.physical || t("dPhysicalUnknown"))}</b></div>
+      <div class="kv"><span>${escapeHtml(t("cState"))}</span><b>${escapeHtml(t(state))}${j.paused ? " — " + escapeHtml(t("pr_" + (j.pauseReason || "user"))) : ""}</b></div>
+      <div class="kv"><span>${escapeHtml(t("cCurrentApk"))}</span><b>${escapeHtml(j.currentLabel || "—")}</b></div>
+      <div class="kv"><span>${escapeHtml(t("cProgress"))}</span><b>${j.done || 0}/${j.total || 0} · ${escapeHtml(t("cCounts", { o: j.ok || 0, f: j.failed || 0, u: j.unverified || 0 }))}</b></div>
+      <div class="kv"><span>${escapeHtml(t("cRemaining"))}</span><b>${j.remaining || 0}</b></div>
+      <div class="ctl-row">
+        ${j.running ? `<button class="ghost small" data-j="pause" ${j.pauseAfterCurrent ? "disabled" : ""}>${escapeHtml(t(j.pauseAfterCurrent ? "pauseAfterSet" : "pauseAfterCurrent"))}</button>
+          <button class="ghost small danger" data-j="cancel">${escapeHtml(t("cancelCurrent"))}</button>` : ""}
+        ${!j.running && j.paused && j.remaining ? `<button class="primary small" data-j="continue">${escapeHtml(t("continueN", { n: j.remaining }))}</button>` : ""}
+      </div>
+      <p class="muted small-note">${escapeHtml(t("cInstallNote"))}</p>`;
+    $$("#cInstall [data-j]").forEach(b => b.onclick = () => ({
+      pause: () => $("#btnPauseAfter").click(),
+      cancel: () => $("#btnCancelCur").click(),
+      continue: () => continueInstall(null),
+    })[b.dataset.j]());
+  }
+
+  // 最近结果 + 正在执行的 adb 命令
+  const lf = sup.lastFailure;
+  $("#cRecent").innerHTML = `
+    <div class="kv"><span>${escapeHtml(t("cLastCheck"))}</span><b>${escapeHtml(fmtTime(sup.lastCheck))} (${escapeHtml(fmtAgo(sup.lastCheck))})</b></div>
+    <div class="kv"><span>${escapeHtml(t("cLastFail"))}</span><b>${lf ? escapeHtml(`${fmtTime(lf.ts)} · ${t("tk_" + lf.stage) || lf.stage} · ${lf.reason}`) : "—"}</b></div>`;
+  const act = sup.active || [];
+  $("#cActive").innerHTML = act.length ? `<h4>${escapeHtml(t("cActiveCmds"))}</h4>` + act.map(a => `
+    <div class="conn"><span class="tag">${escapeHtml(t("src_" + a.source.replace(":", "_")) || a.source)}</span>
+      <span class="mono">${escapeHtml(a.cmd)}</span><span class="muted">${(a.ms / 1000).toFixed(1)}s · PID ${a.pid}</span></div>`).join("") : "";
+}
+$("#cCheck").onclick = () => checkOnce();
+$("#cPauseAll").onclick = () => supAct(S.sup && S.sup.bgPaused ? "/api/supervisor/resume" : "/api/supervisor/pause");
+$("#cPauseWifi").onclick = () => supAct(S.sup && S.sup.wifiPaused ? "/api/supervisor/resume-wifi" : "/api/supervisor/pause-wifi");
+$("#cUsbOnlySel").onchange = async () => {
+  const serial = $("#cUsbOnlySel").value || null;
+  const r = await supAct("/api/supervisor/usb-only", { serial });
+  if (r.ok) toast(serial ? t("tUsbOnlyOn") : t("tUsbOnlyOff"), serial ? (r.usbOnly || {}).name : "", "ok");
+  else renderConsole();
 };
+async function loadCmdLog() {
+  const r = await api("/api/supervisor/log?n=150");
+  if (!r.ok) return;
+  const rows = r.log.slice().reverse().map((x, i) => `
+    <div class="cl-row ${x.rc ? "bad" : ""}" data-i="${i}">
+      <span>${escapeHtml(fmtTime(x.ended))}</span>
+      <span class="tag">${escapeHtml(t("src_" + (x.source || "ui").replace(":", "_")))}</span>
+      <span class="mono">${escapeHtml(x.cmd)}</span>
+      <span>${x.timeout ? "timeout" : "rc=" + x.rc}</span><span>${x.ms}ms</span>
+    </div>
+    <pre class="cl-out hidden">${escapeHtml(x.out || "")}</pre>`).join("");
+  $("#cLog").innerHTML = rows || `<p class="muted">—</p>`;
+  $$("#cLog .cl-row").forEach(row => row.onclick = () => row.nextElementSibling.classList.toggle("hidden"));
+}
+$("#cLogBox").addEventListener("toggle", () => { if ($("#cLogBox").open) loadCmdLog(); });
 
 /* ---------------- 无线 ---------------- */
 function renderWireless() {
@@ -487,14 +835,14 @@ function renderWireless() {
       <div class="wdev">
         <span class="tag ${d.wireless ? "tag-wifi" : "tag-usb"}">${escapeHtml(d.wireless ? t("wTagWiFi") : t("wTagUSB"))}</span>
         <span class="wdev-name">${escapeHtml(d.name || d.serial)}</span>
-        <span class="muted">${escapeHtml(d.serial)}</span>
+        <span class="muted">${escapeHtml(d.serial)} · ${escapeHtml(stateText(d))}</span>
         ${d.duplicate && d.wireless ? `<span class="tag warn">${escapeHtml(t("wDup"))}</span>` : ""}
-        ${d.wireless ? `<button class="ghost small danger wd-dis" data-s="${escapeHtml(d.serial)}">${escapeHtml(t("wForget"))}</button>` : ""}
+        ${d.wireless ? `<button class="ghost small danger wd-dis" data-s="${escapeHtml(d.serial)}">${escapeHtml(t("cDisconnectThis"))}</button>` : ""}
       </div>`).join("");
     box.querySelectorAll(".wd-dis").forEach(b => b.onclick = async () => {
-      const r = await api("/api/wireless/disconnect", { hostPort: b.dataset.s });
-      toast(t("wDisconnected"), b.dataset.s, "ok");
-      refreshDevices();
+      if (!confirm(t("cDisconnectConfirm", { t: b.dataset.s }))) return;
+      const r = await supAct("/api/wireless/disconnect", { hostPort: b.dataset.s });
+      if (r.ok) toast(t("wDisconnected"), b.dataset.s, "ok");
     });
   }
   const hb = $("#wHistoryBox");
@@ -523,7 +871,7 @@ $("#btnPair").onclick = async () => {
   if (r.ok) {
     toast(t("wPairOk"), r.connected ? t("wConnOk", { t: r.target || "" }) : "", "ok");
     $("#pairCode").value = "";
-    refreshDevices(); refreshState();
+    refreshState();
   } else toast(t("wPairFail"), r.error || "", "err");
 };
 $("#btnConnect").onclick = async () => {
@@ -532,13 +880,8 @@ $("#btnConnect").onclick = async () => {
   $("#btnConnect").disabled = true;
   const r = await api("/api/wireless/connect", { hostPort: addr });
   $("#btnConnect").disabled = false;
-  if (r.ok) { toast(t("wConnOk", { t: r.target }), "", "ok"); refreshDevices(); refreshState(); }
+  if (r.ok) { toast(t("wConnOk", { t: r.target }), "", "ok"); refreshState(); }
   else toast(t("wConnFail"), r.error || r.message || "", "err");
-};
-$("#btnDisconnectAll").onclick = async () => {
-  await api("/api/wireless/disconnect", {});
-  toast(t("wDisconnected"), "", "ok");
-  refreshDevices();
 };
 $("#btnSwitchWifi").onclick = async () => {
   const d = currentDevice();
@@ -548,8 +891,8 @@ $("#btnSwitchWifi").onclick = async () => {
   $("#btnSwitchWifi").disabled = false;
   if (r.ok) {
     toast(t("wSwitchOk", { t: r.target }), "", "ok");
-    refreshDevices(); refreshState();
-  } else toast(t("wSwitchFail"), r.error || r.message || "", "err");
+    refreshState();
+  } else toast(t("wSwitchFail"), errText(r), "err");
 };
 
 /* ---------------- 设备应用 / 提取 ---------------- */
@@ -558,7 +901,7 @@ $("#btnScan").onclick = async () => {
   if (!serial) { toast(t("tNoDevice"), t("tNoDeviceSub"), "warn"); return; }
   S.apps = []; S.selected.clear(); renderApps();
   const r = await api("/api/apps/scan", { serial, scope: $("#scopeSel").value, icons: true });
-  if (!r.ok) { toast(t("tScanFail"), r.error || "", "err"); return; }
+  if (!r.ok) { toast(t("tScanFail"), errText(r), "err"); return; }
   S.scanning = true;
   $("#btnScan").disabled = true; $("#btnScanStop").classList.remove("hidden");
   $("#scanProgress").classList.remove("hidden");
@@ -624,7 +967,8 @@ async function extract(pkgs) {
   const serial = $("#deviceSel").value;
   if (!serial) { toast(t("tNoDevice"), t("tNoDeviceSub"), "warn"); return; }
   const apps = S.apps.filter(a => pkgs.includes(a.package));
-  await api("/api/extract", { serial, packages: pkgs, apps });
+  const r = await api("/api/extract", { serial, packages: pkgs, apps });
+  if (!r.ok) { toast(t("tCantStart"), errText(r), "err"); return; }
   toast(t("tExtractStart"), t("tExtractStartSub", { n: pkgs.length }), "ok");
 }
 $("#btnExtractSel").onclick = () => extract(Array.from(S.selected));
@@ -655,7 +999,7 @@ $("#btnAdbDl").onclick = async () => {
 };
 $("#btnAdbSet").onclick = async () => {
   const r = await api("/api/adb/set", { path: $("#adbPath").value.trim() });
-  if (r.ok) { toast(t("tAdbSet"), r.path, "ok"); refreshState(); refreshDevices(); }
+  if (r.ok) { toast(t("tAdbSet"), r.path, "ok"); refreshState(); checkOnce(); }
   else toast(t("tAdbBad"), r.error || "", "err");
 };
 
@@ -671,8 +1015,8 @@ async function refreshState() {
   S.items = st.items || [];
   S.settings = st.settings || {};
   S.settings.__adbOk = !!(st.adb && st.adb.available);
+  S.job = st.job || null;
   renderQueue();
-  renderWireless();
   const sel = $("#profileSel");
   const cur = sel.value;
   sel.innerHTML = `<option value="">${escapeHtml(t("profilePlaceholder"))}</option>` +
@@ -684,9 +1028,7 @@ async function refreshState() {
   $("#adbState").textContent = t(ok ? "adbReady" : "adbMissing");
   $("#adbState").className = "adb-state " + (ok ? "good" : "bad");
   $("#adbPathText").textContent = ok ? st.adb.path : "";
-  const running = st.job && st.job.running;
-  $("#btnInstall").classList.toggle("hidden", !!running);
-  $("#btnStop").classList.toggle("hidden", !running);
+  applySup(st.sup);
   return st;
 }
 
@@ -700,20 +1042,31 @@ function connectEvents() {
   es.onerror = () => { };
 }
 function summaryText(e) {
-  return t("tSummary", { o: e.ok, f: e.failed, s: e.skipped });
+  let s = t("tSummary", { o: e.ok, f: e.failed, s: e.skipped });
+  if (e.unverified) s += t("tSummaryUnv", { n: e.unverified });
+  return s;
 }
 function handleEvent(e) {
   switch (e.type) {
+    case "supervisor":
+      applySup(e.state);
+      break;
+    case "job":
+      S.job = e.job;
+      renderJobControls();
+      if (S.tab === "console") renderConsole();
+      break;
     case "install_start":
       $("#progressWrap").classList.remove("hidden");
       $("#progressBar").style.width = "0";
       $("#progressText").textContent = t("tPrepare", { n: e.total });
-      $("#btnInstall").classList.add("hidden");
-      $("#btnStop").classList.remove("hidden");
       break;
     case "item": {
       const it = S.items.find(x => x.id === e.id);
-      if (it) { it.status = e.status; it.code = e.code; it.arg = e.arg; }
+      if (it) {
+        it.status = e.status; it.code = e.code; it.arg = e.arg;
+        if (e.installed !== undefined) it.installed = e.installed;
+      }
       renderQueue();
       if (e.progress) {
         const p = e.progress;
@@ -723,14 +1076,25 @@ function handleEvent(e) {
       }
       const name = it ? (it.label || it.file) : "";
       if (e.status === "success")
-        toast(t("tInstalled"), name + (e.seconds ? " · " + t("tTook", { n: e.seconds }) : ""), "ok");
+        toast(t("tInstalled"), name + " · " + codeText(e.code, e.arg) +
+          (e.seconds ? " · " + t("tTook", { n: e.seconds }) : ""), "ok");
       if (e.status === "failed") {
         const hint = codeHint(e.code);
         toast(t("tFailed", { name }), codeText(e.code, e.arg) + (hint ? " — " + hint : ""), "err");
       }
+      if (e.status === "unverified") toast(t("tUnverified", { name }), codeText(e.code, e.arg), "warn");
+      if (e.status === "cancelled" || e.status === "cancel_installed")
+        toast(t("tCancelled", { name }), codeText(e.code, e.arg), "warn");
       if (e.status === "skipped") toast(t("tSkipped"), name + " — " + codeText(e.code, e.arg), "warn");
       break;
     }
+    case "install_paused":
+      S.job = e.job;
+      renderJobControls();
+      toast(t("tPausedTitle"), t("jp_" + (e.reason || "user"), { d: (e.job || {}).name || "", n: (e.job || {}).remaining || 0 }),
+        ["target_lost", "target_mismatch"].includes(e.reason) ? "err" : "warn");
+      refreshState();
+      break;
     case "log":
       $("#log").textContent += e.text + "\n";
       $("#log").scrollTop = $("#log").scrollHeight;
@@ -739,12 +1103,10 @@ function handleEvent(e) {
       const sum = summaryText(e);
       $("#progressBar").style.width = "100%";
       $("#progressText").textContent = t("tAllDoneLine", { s: sum, sec: e.seconds });
-      $("#btnInstall").classList.remove("hidden");
-      $("#btnStop").classList.add("hidden");
-      toast(t("tAllDone"), sum, e.failed ? "warn" : "ok");
+      toast(t("tAllDone"), sum, e.failed || e.unverified ? "warn" : "ok");
       const rows = (e.results || []).map(r => {
-        const cls = r.status === "success" ? "r-ok" : (r.status === "skipped" ? "r-skip" : "r-err");
-        const mark = r.status === "success" ? "✓" : (r.status === "skipped" ? "–" : "✕");
+        const cls = r.status === "success" ? "r-ok" : (r.status === "skipped" || r.status === "unverified" ? "r-skip" : "r-err");
+        const mark = r.status === "success" ? "✓" : (r.status === "skipped" ? "–" : r.status === "unverified" ? "⚠" : "✕");
         const hint = r.status === "failed" ? codeHint(r.code) : "";
         return `<div class="res"><span class="${cls}">${mark}</span>
           <span class="r-name">${escapeHtml(r.label || "")}</span>
@@ -752,6 +1114,7 @@ function handleEvent(e) {
       }).join("");
       modal(t("tDoneTitle", { s: sum }),
         `<p class="muted">${escapeHtml(t("tDoneBody", { n: e.total, sec: e.seconds }))}</p>${rows}`);
+      refreshState();
       break;
     }
     case "scan_start":
@@ -779,6 +1142,7 @@ function handleEvent(e) {
       toast(t("tExtracting"), e.dir, "ok");
       break;
     case "extract_done": {
+      if (e.blocked) break;
       const rows = (e.results || []).map(r =>
         `<div class="res"><span class="${r.ok ? "r-ok" : "r-err"}">${r.ok ? "✓" : "✕"}</span>
          <span class="r-name">${escapeHtml(r.label)}</span>
@@ -807,10 +1171,6 @@ function handleEvent(e) {
         modal(t("tUninstallDone", { a: e.ok, b: e.total }), rows);
       }
       break;
-    case "wireless":
-      if (e.action === "reconnected") toast(t("wReconnected", { t: e.target }), "", "ok");
-      refreshDevices();
-      break;
     case "marked":
       refreshState();
       break;
@@ -820,7 +1180,7 @@ function handleEvent(e) {
         $("#btnAdbDl").disabled = false;
         toast(e.ok ? t("tAdbReady") : t("tAdbFail"), e.ok ? t("tAdbReadySub") : e.text,
           e.ok ? "ok" : "err");
-        refreshState(); refreshDevices();
+        refreshState(); checkOnce();
       }
       break;
     case "queue":
@@ -834,7 +1194,7 @@ function handleEvent(e) {
   applyLang(detectLang(localStorage.getItem("lang")));
   connectEvents();
   refreshState();
-  refreshDevices();
-  setInterval(refreshDevices, 8000);
-  window.addEventListener("focus", () => refreshDevices());
+  loadSup();
+  // 只刷新控制台上的「N 秒后」倒计时，纯界面渲染，不发任何 adb 请求
+  setInterval(() => { if (S.tab === "console") renderConsole(); }, 1000);
 })();

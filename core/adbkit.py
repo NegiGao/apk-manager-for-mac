@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """adb 封装: 定位/下载 adb、设备列表、安装、已装应用枚举与 APK 提取。"""
+import collections
 import json
 import os
 import re
@@ -106,14 +107,63 @@ class AdbError(Exception):
     pass
 
 
+# 这些子命令作用于某一台具体设备，必须带 -s 指定目标，避免设备多于一台时装错机器
+DEVICE_CMDS = {
+    "install", "install-multiple", "uninstall", "shell", "exec-out", "pull", "push",
+    "tcpip", "usb", "get-state", "get-serialno", "reboot", "root", "unroot",
+    "logcat", "forward", "reverse", "sideload",
+}
+
+_ctx = threading.local()
+
+
+class _Source(object):
+    """with adb.source("bg:discovery"): ... —— 给这段代码里发出的 adb 命令打上来源标签，
+    控制台里能看到每条命令是谁发的（界面操作 / 后台任务 / 安装）。"""
+
+    def __init__(self, name):
+        self.name = name
+        self.prev = None
+
+    def __enter__(self):
+        self.prev = getattr(_ctx, "source", None)
+        _ctx.source = self.name
+        return self
+
+    def __exit__(self, *a):
+        _ctx.source = self.prev
+
+
+def _short(cmd, path):
+    out = []
+    for i, c in enumerate(cmd):
+        if i == 0 and c == path:
+            out.append("adb")
+        elif " " in c or not c:
+            out.append('"%s"' % c)
+        else:
+            out.append(c)
+    return " ".join(out)
+
+
 class Adb(object):
     def __init__(self, path=None):
         self.path = path or find_adb()
         self._lock = threading.Lock()
+        self._lk = threading.Lock()
+        self.log = collections.deque(maxlen=400)   # 最近的 adb 命令记录
+        self.active = {}                            # 正在执行的 adb 命令 token -> 信息
+        self._tok = 0
+        self.listeners = []                         # 命令结束时的回调
+        self._version = None
 
     @property
     def available(self):
         return bool(self.path and os.path.isfile(self.path))
+
+    @staticmethod
+    def source(name):
+        return _Source(name)
 
     def _base(self, serial=None):
         if not self.available:
@@ -123,33 +173,179 @@ class Adb(object):
             cmd += ["-s", serial]
         return cmd
 
-    def run(self, args, serial=None, timeout=120, binary=False):
-        cmd = self._base(serial) + args
-        p = subprocess.run(cmd, capture_output=True, timeout=timeout,
-                           creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
-        if binary:
-            return p.returncode, p.stdout, p.stderr.decode("utf-8", "replace")
-        return (p.returncode,
-                p.stdout.decode("utf-8", "replace"),
-                p.stderr.decode("utf-8", "replace"))
+    @staticmethod
+    def _check_scope(args, serial):
+        if args and args[0] in DEVICE_CMDS and not serial:
+            raise AdbError("拒绝执行未指定目标设备的 adb %s" % args[0])
 
-    def stream(self, args, serial=None, on_line=None, timeout=1800):
-        """流式执行，逐行回调。返回 (returncode, 全部输出)。"""
+    def _begin(self, proc, cmd, serial):
+        with self._lk:
+            self._tok += 1
+            tok = self._tok
+            self.active[tok] = {
+                "pid": proc.pid, "cmd": _short(cmd, self.path), "serial": serial,
+                "source": getattr(_ctx, "source", None) or "ui",
+                "started": time.time(),
+            }
+        return tok
+
+    def _end(self, tok, rc, out, t0, timed_out=False):
+        with self._lk:
+            info = self.active.pop(tok, None) or {}
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        rec = dict(info)
+        rec.update({
+            "rc": rc, "ms": int((time.time() - t0) * 1000),
+            "out": (out or "").strip()[-600:], "timeout": timed_out,
+            "ended": time.time(),
+        })
+        rec.pop("started", None)
+        self.log.append(rec)
+        for cb in list(self.listeners):
+            try:
+                cb(rec)
+            except Exception:
+                pass
+
+    def active_list(self):
+        with self._lk:
+            now = time.time()
+            return [dict(v, ms=int((now - v["started"]) * 1000), pid=v["pid"])
+                    for v in self.active.values()]
+
+    def run(self, args, serial=None, timeout=120, binary=False):
+        self._check_scope(args, serial)
         cmd = self._base(serial) + args
+        t0 = time.time()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+        tok = self._begin(proc, cmd, serial)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            self._end(tok, -9, (out or b"") + (err or b""), t0, timed_out=True)
+            raise
+        except Exception:
+            self._end(tok, -1, b"", t0)
+            raise
+        self._end(tok, proc.returncode, (out or b"") + (err or b""), t0)
+        if binary:
+            return proc.returncode, out, err.decode("utf-8", "replace")
+        return (proc.returncode, out.decode("utf-8", "replace"),
+                err.decode("utf-8", "replace"))
+
+    def stream(self, args, serial=None, on_line=None, timeout=1800, on_proc=None):
+        """流式执行，逐行回调。返回 (returncode, 全部输出)。
+        on_proc(proc) 让调用方拿到进程句柄（用于「取消当前安装」）。"""
+        self._check_scope(args, serial)
+        cmd = self._base(serial) + args
+        t0 = time.time()
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 bufsize=1, universal_newlines=True, errors="replace")
+        tok = self._begin(proc, cmd, serial)
+        if on_proc:
+            try:
+                on_proc(proc)
+            except Exception:
+                pass
         lines = []
-        start = time.time()
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            lines.append(line)
-            if on_line and line.strip():
-                on_line(line)
-            if time.time() - start > timeout:
-                proc.kill()
-                break
-        proc.wait()
+        timed_out = False
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                lines.append(line)
+                if on_line and line.strip():
+                    on_line(line)
+                if time.time() - t0 > timeout:
+                    timed_out = True
+                    proc.kill()
+                    break
+            proc.wait()
+        finally:
+            self._end(tok, proc.returncode, "\n".join(lines), t0, timed_out)
         return proc.returncode, "\n".join(lines)
+
+    # -- adb 服务本身的信息（只读，不会启动或重启服务）-------------------
+    def version(self):
+        if self._version is None and self.available:
+            try:
+                code, out, err = self.run(["version"], timeout=8)
+                m = re.search(r"Android Debug Bridge version ([\d.]+)", out)
+                v = re.search(r"Version ([\w.\-]+)", out)
+                self._version = " / ".join(x for x in [
+                    m.group(1) if m else None, v.group(1) if v else None] if x) or out.strip()[:60]
+            except Exception:
+                self._version = None
+        return self._version
+
+    def server_status(self):
+        """adb 服务状态。只做只读检查：探测端口、列出进程；不 start-server、不 kill。"""
+        port = int(os.environ.get("ANDROID_ADB_SERVER_PORT") or 5037)
+        listening = False
+        try:
+            import socket
+            with socket.create_connection(("127.0.0.1", port), 0.3):
+                listening = True
+        except Exception:
+            pass
+        procs = []
+        ours = {v["pid"] for v in self.active_list()}
+        mine_real = os.path.realpath(self.path) if self.path else None
+        try:
+            out = subprocess.run(["ps", "-Ao", "pid=,ppid=,args="], capture_output=True,
+                                 timeout=3).stdout.decode("utf-8", "replace")
+        except Exception:
+            out = ""
+        for line in out.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, ppid, args = parts
+            toks = args.split()
+            argv0 = toks[0] if toks else ""
+            # 有些工具用脚本包一层 adb：ps 里第一个是解释器，第二个才是 adb
+            if os.path.basename(argv0) in ("bash", "sh", "zsh", "python", "python3") and len(toks) > 1:
+                argv0 = toks[1]
+                args = " ".join(toks[1:])
+            if os.path.basename(argv0) != "adb":
+                continue
+            pid, ppid = int(pid), int(ppid)
+            is_server = "fork-server" in args or ("server" in args.split()[1:3])
+            same_bin = bool(mine_real) and os.path.realpath(argv0) == mine_real
+            if pid in ours or ppid == os.getpid():
+                owner = "ours"
+            elif is_server:
+                owner = "server_same" if same_bin else "server_other"
+            else:
+                owner = "unknown"
+            procs.append({"pid": pid, "args": args[:200], "server": is_server,
+                          "sameBinary": same_bin, "owner": owner})
+        return {"port": port, "listening": listening, "processes": procs,
+                "path": self.path, "version": self.version()}
+
+    def get_state(self, serial, timeout=6):
+        try:
+            code, out, err = self.run(["get-state"], serial=serial, timeout=timeout)
+            return (out or err).strip().splitlines()[-1] if (out or err).strip() else ""
+        except Exception as exc:
+            return "error: %s" % exc
+
+    def physical_serial(self, serial, timeout=8):
+        """设备的物理序号（ro.serialno），用来判断 USB 和 Wi-Fi 两个入口是不是同一台机器。"""
+        try:
+            code, out, _ = self.run(
+                ["shell", "getprop ro.serialno; getprop ro.boot.serialno"],
+                serial=serial, timeout=timeout)
+            for v in out.splitlines():
+                v = v.strip()
+                if v and v != "unknown":
+                    return v
+        except Exception:
+            pass
+        return None
 
     def start_server(self):
         try:
@@ -160,7 +356,7 @@ class Adb(object):
     # -- 设备 -----------------------------------------------------------
     def devices(self):
         try:
-            code, out, err = self.run(["devices", "-l"], timeout=20)
+            code, out, err = self.run(["devices", "-l"], timeout=8)
         except Exception as exc:
             raise AdbError(str(exc))
         devs = []
@@ -204,9 +400,8 @@ class Adb(object):
         if not code:
             return False, "请输入手机上显示的 6 位配对码"
         try:
-            p = subprocess.run(self._base() + ["pair", host_port, code],
-                               capture_output=True, timeout=60)
-            out = (p.stdout + p.stderr).decode("utf-8", "replace")
+            rc, o, e = self.run(["pair", host_port, code], timeout=60)
+            out = (o or "") + (e or "")
         except subprocess.TimeoutExpired:
             return False, "配对超时：检查手机与电脑是否在同一个 Wi-Fi"
         except Exception as exc:
@@ -215,11 +410,11 @@ class Adb(object):
             return True, out.strip()
         return False, out.strip() or "配对失败"
 
-    def connect(self, host_port):
+    def connect(self, host_port, timeout=15):
         if ":" not in host_port:
             host_port += ":5555"
         try:
-            code, out, err = self.run(["connect", host_port], timeout=30)
+            code, out, err = self.run(["connect", host_port], timeout=timeout)
         except Exception as exc:
             return False, str(exc), host_port
         text = (out or "") + (err or "")
@@ -227,8 +422,10 @@ class Adb(object):
             and "failed" not in text.lower()
         return ok, text.strip(), host_port
 
-    def disconnect(self, host_port=None):
-        args = ["disconnect"] + ([host_port] if host_port else [])
+    def disconnect(self, host_port):
+        if not host_port:
+            return False, "必须指定要断开的 IP:端口"
+        args = ["disconnect", host_port]
         try:
             code, out, err = self.run(args, timeout=30)
             return True, ((out or "") + (err or "")).strip()
@@ -269,28 +466,32 @@ class Adb(object):
     def device_detail(self, serial):
         props = {}
         try:
-            code, out, _ = self.run(
-                ["shell", "getprop ro.product.brand; getprop ro.product.model; "
-                 "getprop ro.build.version.release; getprop ro.build.version.sdk; "
-                 "getprop ro.product.cpu.abi"],
-                serial=serial, timeout=20)
-            vals = [v.strip() for v in out.splitlines() if v.strip()]
-            keys = ["brand", "model", "android", "sdk", "abi"]
-            for k, v in zip(keys, vals):
-                props[k] = v
+            keys = [("brand", "ro.product.brand"), ("model", "ro.product.model"),
+                    ("android", "ro.build.version.release"), ("sdk", "ro.build.version.sdk"),
+                    ("abi", "ro.product.cpu.abi"), ("serialno", "ro.serialno")]
+            cmd = "; ".join('echo "%s=$(getprop %s)"' % (k, p) for k, p in keys)
+            code, out, _ = self.run(["shell", cmd], serial=serial, timeout=8)
+            for line in out.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    if k.strip() in dict(keys) and v.strip():
+                        props[k.strip()] = v.strip()
         except Exception:
             pass
         return props
 
     # -- 安装 -----------------------------------------------------------
     def install(self, serial, apk_paths, on_line=None, flags=None,
-                timeout=1800):
+                timeout=1800, on_proc=None):
+        if not serial:
+            raise AdbError("安装必须指定目标设备")
         flags = list(flags or [])
         if len(apk_paths) > 1:
             args = ["install-multiple"] + flags + list(apk_paths)
         else:
             args = ["install"] + flags + [apk_paths[0]]
-        return self.stream(args, serial=serial, on_line=on_line, timeout=timeout)
+        return self.stream(args, serial=serial, on_line=on_line, timeout=timeout,
+                           on_proc=on_proc)
 
     def uninstall(self, serial, package, keep_data=False):
         args = ["uninstall"]
@@ -343,9 +544,12 @@ class Adb(object):
     def installed_map(self, serial, packages=None, chunk=20):
         """返回设备上这些包的 {pkg: {versionName, versionCode}}；未安装的不出现。"""
         present = set()
-        try:
-            code, out, _ = self.run(["shell", "pm", "list", "packages"],
-                                    serial=serial, timeout=120)
+        code, out, err = self.run(["shell", "pm", "list", "packages"],
+                                  serial=serial, timeout=60)
+        if code != 0 or not out.strip():
+            # 设备离线 / 未授权 / 已拔线：必须报错，不能当成「什么都没装」
+            raise AdbError((err or out or "pm list 失败").strip().splitlines()[-1][:160])
+        if True:
             for line in out.splitlines():
                 line = line.strip()
                 if not line.startswith("package:"):
@@ -353,8 +557,6 @@ class Adb(object):
                 body = line[len("package:"):].strip()
                 # 带 -f 时形如 /data/app/xx/base.apk=com.foo
                 present.add(body[body.rfind("=") + 1:] if "=" in body else body)
-        except Exception:
-            return {}
         wanted = [p for p in (packages or present) if p in present]
         result = {p: {"versionName": None, "versionCode": None} for p in wanted}
         for i in range(0, len(wanted), chunk):
