@@ -354,11 +354,45 @@ def t4_extract_close(c):
     c.h3 = home
 
 
+def _viewer(port):
+    """模拟一个界面窗口：保持事件流连接。"""
+    resp = urllib.request.urlopen("http://127.0.0.1:%s/api/events" % port, timeout=120)
+    resp.readline()
+    return resp
+
+
 def t5_quit(c):
-    say("== T5 退出")
-    r = c.quit(c.p1)
-    gone = wait(lambda: not c.servers(), 15)
-    check(r.get("ok") and gone, "点「退出」：后台进程结束", str(r))
+    say("== T5 退出 / 关窗（各用一个新的测试实例；窗口用事件流连接模拟）")
+    home = c.make_home("h5-退出")
+    p = c.launch(home)
+    port = c.wait_port(home)
+    if not port:
+        raise Stop("T5 启动失败")
+    c.adb_guard(home, port)
+    v = _viewer(port)
+    time.sleep(2)
+    r = c.quit(port)
+    t = time.time()
+    gone = wait(lambda: p.poll() is not None, 15)
+    check(r.get("ok") and gone, "窗口开着时点「退出」：后台进程立即结束", "%s，%.1f 秒后进程退出" % (r, time.time() - t))
+    try:
+        v.close()
+    except Exception:
+        pass
+
+    home = c.make_home("h6-关窗")
+    p = c.launch(home)
+    port = c.wait_port(home)
+    if not port:
+        raise Stop("T5b 启动失败")
+    c.adb_guard(home, port)
+    v = _viewer(port)
+    time.sleep(2)
+    v.close()
+    t = time.time()
+    gone = wait(lambda: p.poll() is not None, 90, step=0.5)
+    dt = time.time() - t
+    check(gone and dt >= 20, "空闲时关窗：不会立刻退出，约 25 秒宽限后自动退出", "关窗后 %.0f 秒退出" % dt)
 
 
 def t6_upgrade(c, label, old_dir):
@@ -448,6 +482,7 @@ def main():
     ap.add_argument("--old150")
     ap.add_argument("--work", required=True)
     ap.add_argument("--dry-run-linux", action="store_true", help="只用于在 Linux 上演练驱动本身")
+    ap.add_argument("--only", help="只跑这些（逗号分隔，如 T5）；T0 解压总会先跑")
     a = ap.parse_args()
     if sys.platform != "darwin" and not a.dry_run_linux:
         print("这个驱动只在 macOS 上运行"); return 2
@@ -458,15 +493,22 @@ def main():
     say("驱动 Python：%s %s" % (sys.executable, sys.version.split()[0]))
     stopped = None
     try:
+        only = set((a.only or "T1,T2,T3,T4,T5,T6").upper().split(","))
         t0_package(c)
-        t1_start(c)
-        t2_single(c)
-        t3_version(c)
-        t4_extract_close(c)
-        t5_quit(c)
-        for label, d in (("v1.4", a.old14), ("v1.5.0", a.old150)):
-            if d:
-                t6_upgrade(c, label, d)
+        if only & {"T1", "T2", "T3"}:
+            t1_start(c)
+        if "T2" in only:
+            t2_single(c)
+        if "T3" in only:
+            t3_version(c)
+        if "T4" in only:
+            t4_extract_close(c)
+        if "T5" in only:
+            t5_quit(c)
+        if "T6" in only:
+            for label, d in (("v1.4", a.old14), ("v1.5.0", a.old150)):
+                if d:
+                    t6_upgrade(c, label, d)
     except Stop as e:
         stopped = str(e)
         check(False, "验收中止", stopped)
