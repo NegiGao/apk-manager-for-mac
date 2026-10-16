@@ -333,6 +333,23 @@ class Adb(object):
         except Exception as exc:
             return "error: %s" % exc
 
+    def read_serialno(self, serial, timeout=8):
+        """三态读取物理序号：ok（有值）/ empty（读成功但设备不提供）/ error（读取本身失败）。"""
+        try:
+            code, out, err = self.run(
+                ["shell", "echo __SN__; getprop ro.serialno; getprop ro.boot.serialno; echo __END__"],
+                serial=serial, timeout=timeout)
+        except Exception as exc:
+            return {"state": "error", "err": str(exc)[:200]}
+        if "__SN__" not in out or "__END__" not in out:
+            return {"state": "error", "err": ((err or out).strip().splitlines() or ["?"])[-1][:200]}
+        body = out.split("__SN__", 1)[1].split("__END__", 1)[0]
+        for v in body.splitlines():
+            v = v.strip()
+            if v and v != "unknown":
+                return {"state": "ok", "value": v}
+        return {"state": "empty"}
+
     def physical_serial(self, serial, timeout=8):
         """设备的物理序号（ro.serialno），用来判断 USB 和 Wi-Fi 两个入口是不是同一台机器。"""
         try:
@@ -517,6 +534,29 @@ class Adb(object):
             return (vn.group(1) if vn else None, int(vc.group(1)) if vc else None)
         except Exception:
             return (None, None)
+
+    def query_package(self, serial, package, timeout=20):
+        """三态查询，用于安装后核验与取消后核验：
+            present  —— 查询成功，设备上有这个包（附版本）
+            absent   —— 查询成功，设备上确实没有
+            error    —— 查询本身失败（离线、断开、命令出错），结果未知
+        「查询失败」绝不能被当成「没装」。"""
+        cmd = ("echo __BEGIN__; pm path %s; "
+               "dumpsys package %s | grep -m2 -E 'versionCode=|versionName='; "
+               "echo __END__" % (package, package))
+        try:
+            code, out, err = self.run(["shell", cmd], serial=serial, timeout=timeout)
+        except Exception as exc:
+            return {"state": "error", "err": str(exc)[:200]}
+        if "__BEGIN__" not in out or "__END__" not in out:
+            return {"state": "error", "err": ((err or out).strip().splitlines() or ["?"])[-1][:200]}
+        body = out.split("__BEGIN__", 1)[1].split("__END__", 1)[0]
+        if not any(l.strip().startswith("package:") for l in body.splitlines()):
+            return {"state": "absent"}
+        vn = re.search(r"versionName=(\S+)", body)
+        vc = re.search(r"versionCode=(\d+)", body)
+        return {"state": "present", "vn": vn.group(1) if vn else None,
+                "vc": int(vc.group(1)) if vc else None}
 
     # -- 包枚举 ---------------------------------------------------------
     def list_packages(self, serial, scope="third"):

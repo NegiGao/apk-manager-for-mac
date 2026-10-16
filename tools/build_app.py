@@ -15,24 +15,50 @@ APP_NAME = "APK Manager"
 sys.path.insert(0, HERE)
 from make_icon import build_icns  # noqa: E402
 
+def _read_version():
+    ns = {}
+    exec(open(os.path.join(SRC, "core", "version.py"), encoding="utf-8").read(), ns)
+    return ns["VERSION"]
+
+
+VERSION = _read_version()
+
 LAUNCHER = r'''#!/bin/bash
-# APK 安装管家 —— .app 启动器
-# 只做一件事：找到 python3 然后 exec 过去。挑端口、开窗口都交给 Python，
-# 这样整个冷启动路径上只有一次解释器启动。
+# APK Manager —— .app 启动器
+# 从 Finder 双击时 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，所以这里只用绝对路径找 Python，
+# 不依赖终端里的 PATH。找到后 exec 过去，挑端口、开窗口、单实例都由 Python 处理。
 BUNDLE="$(cd "$(dirname "$0")/../.." && pwd)"
 RES="$BUNDLE/Contents/Resources"
-LOG="$HOME/Library/Logs/APK安装管家.log"
-mkdir -p "$HOME/Library/Logs"
+LOGDIR="$HOME/Library/Logs"
+LOG="$LOGDIR/APK安装管家.log"
+mkdir -p "$LOGDIR"
 
-# Homebrew 的 python3 排在前面：/usr/bin/python3 是 Xcode 命令行工具的转发壳，
-# 每次启动都要多走一次 xcrun 查找，明显更慢。
 PY=""
-for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-  [ -x "$c" ] && PY="$c" && break
+for c in \
+  "$APKMGR_PYTHON" \
+  /opt/homebrew/bin/python3 \
+  /usr/local/bin/python3 \
+  /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+  "$HOME/.pyenv/shims/python3"
+do
+  [ -n "$c" ] && [ -x "$c" ] && PY="$c" && break
 done
+# /usr/bin/python3 在没装 Xcode 命令行工具时只是一个占位程序，运行它会弹安装框；
+# 先确认命令行工具确实装了再用它。
+if [ -z "$PY" ] && [ -x /usr/bin/python3 ] && /usr/bin/xcode-select -p >/dev/null 2>&1; then
+  PY=/usr/bin/python3
+fi
+
+{ echo "[$(date '+%Y-%m-%d %H:%M:%S')] launcher: bundle=$BUNDLE python=${PY:-<none>}"; } >>"$LOG" 2>/dev/null
+
 if [ -z "$PY" ]; then
-  osascript -e 'display alert "缺少 Python 3" message "请在「终端」里执行一次：xcode-select --install
-装好后再打开本程序。" as critical'
+  /usr/bin/osascript -e 'display alert "APK Manager: Python 3 not found / 未找到 Python 3 / Python 3 が見つかりません" message "Install one of / 任选一种安装 / いずれかをインストール:
+
+• xcode-select --install   (Command Line Tools)
+• brew install python
+• python.org installer
+
+Python 3.8+ is required." as critical' >/dev/null 2>&1
   exit 1
 fi
 
@@ -56,6 +82,11 @@ def build():
         src = os.path.join(SRC, name)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(res, name))
+    os.makedirs(os.path.join(res, "tools"), exist_ok=True)
+    shutil.copy2(os.path.join(SRC, "tools", "mac_diagnose.sh"), os.path.join(res, "tools", "mac_diagnose.sh"))
+    os.chmod(os.path.join(res, "tools", "mac_diagnose.sh"), 0o755)
+    os.makedirs(os.path.join(res, "docs"), exist_ok=True)
+    shutil.copy2(os.path.join(SRC, "docs", "MAC_ACCEPTANCE.md"), os.path.join(res, "docs", "MAC_ACCEPTANCE.md"))
     for folder in ("core", "web"):
         shutil.copytree(os.path.join(SRC, folder), os.path.join(res, folder),
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -81,8 +112,8 @@ def build():
         "CFBundleExecutable": "launcher",
         "CFBundleIconFile": "app.icns",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "1.5",
-        "CFBundleVersion": "1.5",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "CFBundleInfoDictionaryVersion": "6.0",
         "LSMinimumSystemVersion": "10.13",
         "NSHighResolutionCapable": True,

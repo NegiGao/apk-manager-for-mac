@@ -14,10 +14,21 @@
 import os
 import socket
 import sys
+import time
+
+if sys.version_info < (3, 8):      # 先于任何新语法检查版本，给出明确提示而不是闪退
+    msg = "APK Manager needs Python 3.8 or newer (found %d.%d)." % sys.version_info[:2]
+    sys.stderr.write(msg + "\n")
+    if sys.platform == "darwin":
+        os.system("osascript -e 'display alert \"APK Manager\" message \"%s\"' >/dev/null 2>&1" % msg)
+    sys.exit(1)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.paths import PORT_FILE, BROWSER_FILE, SUPPORT_DIR  # noqa: E402
+from core.version import VERSION  # noqa: E402
+
+LOCK_FILE = os.path.join(SUPPORT_DIR, "instance.lock")
 
 # 优先用这些浏览器的「应用窗口」模式打开（没有地址栏，看着就是个独立 App）
 BROWSERS = [
@@ -95,20 +106,98 @@ def open_window(url):
         return False
 
 
-def already_running():
-    """已经有一个实例在跑就返回它的地址，这时只要把窗口重新拉起来。"""
-    port = _read(PORT_FILE)
-    if not port.isdigit():
-        return None
+def ping(port, timeout=0.4):
+    """问一下这个端口上的是不是本程序、什么版本、忙不忙。旧版本没有 version 字段。"""
+    import json
     try:
-        with socket.create_connection(("127.0.0.1", int(port)), 0.25) as c:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout) as c:
+            c.settimeout(timeout + 0.6)
             c.sendall(b"GET /api/ping HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-            if b"200" in c.recv(64):
-                return "http://127.0.0.1:%s/" % port
+            data = b""
+            while True:
+                chunk = c.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        if b" 200 " not in data.split(b"\r\n", 1)[0]:
+            return None
+        body = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b"{}"
+        info = json.loads(body.decode("utf-8") or "{}")
+        info["port"] = int(port)
+        return info
     except Exception:
-        pass
-    return None
+        return None
 
+
+def _http(port, method, path, body=None, timeout=3):
+    import json
+    import urllib.request
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method=method,
+                                 data=(json.dumps(body or {}).encode() if method == "POST" else None),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=timeout))
+    except Exception:
+        return None
+
+
+def running_instance():
+    port = _read(PORT_FILE)
+    return ping(port) if port.isdigit() else None
+
+
+def old_instance_busy(info):
+    if "busy" in info:
+        return bool(info["busy"])
+    st = _http(info["port"], "GET", "/api/state") or {}     # 旧版本：看它的安装任务
+    return bool((st.get("job") or {}).get("running") or (st.get("scan") or {}).get("running"))
+
+
+def acquire_lock():
+    """单实例锁。进程退出（包括崩溃）时系统自动释放，不会留下死锁。"""
+    try:
+        import fcntl
+    except ImportError:                 # 非 POSIX 系统：不加锁
+        return -1
+    os.makedirs(SUPPORT_DIR, exist_ok=True)
+    fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def log(msg):
+    sys.stdout.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    sys.stdout.flush()
+
+
+def settle_existing(app_mode):
+    """处理已经在运行的实例。返回 True 表示「已交给现有实例，本进程应退出」。"""
+    info = running_instance()
+    if not info:
+        return False
+    url = "http://127.0.0.1:%d/" % info["port"]
+    if info.get("version") == VERSION:
+        log("已有同版本实例（PID %s），只打开窗口" % info.get("pid"))
+        if app_mode:
+            open_window(url)
+        return True
+    if old_instance_busy(info):
+        # 旧版本正在安装 / 扫描：不能把它关掉，先用它
+        log("旧版本实例 %s 正在工作，暂不替换，打开它的窗口" % info.get("version", "<1.5.1"))
+        if app_mode:
+            open_window(url)
+        return True
+    log("发现旧版本实例 %s，空闲，请它退出后由新版本接管" % info.get("version", "<1.5.1"))
+    _http(info["port"], "POST", "/api/quit", {})
+    for _ in range(80):
+        if not ping(info["port"], 0.2):
+            break
+        time.sleep(0.1)
+    return False
 
 def bind_port(port=0):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -155,12 +244,26 @@ def main():
     if not app_mode and port == 0:
         port = 8777
 
-    # 已经有实例在跑：把窗口拉回来就行，不用再起一个服务
-    if app_mode:
-        url = already_running()
-        if url:
-            open_window(url)
+    log("APK Manager %s · Python %s (%s) · PID %d" % (
+        VERSION, "%d.%d.%d" % sys.version_info[:3], sys.executable, os.getpid()))
+
+    # 已经有实例在跑：同版本就只拉起窗口；旧版本空闲就让它退出，由新版本接管
+    if settle_existing(app_mode):
+        return
+    # 单实例锁：连点多次、多个启动同时进来，也只会有一个后台服务
+    lock_fd = None
+    for _ in range(100):
+        lock_fd = acquire_lock()
+        if lock_fd is not None:
+            break
+        if settle_existing(app_mode):   # 另一个启动刚抢到锁，等它起来后交给它
             return
+        time.sleep(0.1)
+    if lock_fd is None:
+        log("另一个实例持有锁但没有响应，本次不再启动第二个后台服务")
+        return
+    if settle_existing(app_mode):       # 抢到锁之后再确认一次（旧版本不持锁）
+        return
 
     # 先绑端口 —— 这样浏览器马上就能开始加载，不用等下面的导入
     try:
@@ -177,6 +280,7 @@ def main():
     from core.server import serve        # 到这一步才付导入的代价
     httpd, url, boot = serve(sock=sock, open_browser=not (app_mode or no_browser))
 
+    log("服务已启动：%s" % url)
     if not app_mode:
         print("=" * 56)
         print("  APK 安装管家已启动")

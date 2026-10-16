@@ -68,6 +68,9 @@ class Supervisor(object):
         self.wifi_connect_pending = bool(st.get("autoReconnect", True))
         self.last_failure = None
         self.last_check = None
+        self.verify_pending_req = True      # 启动时也先核验上次留下的「待核验」
+        self.our_connects = {}               # 本程序发起过 connect 的地址 -> 时间
+        self.adb.listeners.append(self._on_cmd)
         self.server = None
         self.running = None             # 正在执行的任务名
         self.tasks = {n: {"state": "idle", "lastRun": None, "lastOk": None,
@@ -139,6 +142,15 @@ class Supervisor(object):
                 "install": job_pub,
             }
 
+    def _on_cmd(self, rec):
+        parts = (rec.get("cmd") or "").split()
+        if "connect" in parts:
+            tgt = parts[parts.index("connect") + 1] if len(parts) > parts.index("connect") + 1 else ""
+            if tgt:
+                if ":" not in tgt:
+                    tgt += ":5555"
+                self.our_connects[tgt] = rec.get("ended") or _now()
+
     def physical_of(self, serial):
         p = (self.props.get(serial) or {}).get("serialno")
         if not p and is_wireless(serial):
@@ -159,6 +171,10 @@ class Supervisor(object):
                 self.bg_paused = True
                 self.gen += 1
                 self._persist()
+        # 暂停后台 = 本程序不再主动碰设备：正在执行的那个 APK 让它装完，但不开始下一项
+        j = self.E.job or {}
+        if j.get("running"):
+            self.E.pause_after_current("bg_paused")
         self._emit()
         return {"ok": True}
 
@@ -169,6 +185,7 @@ class Supervisor(object):
                 self.tasks["discovery"].update(next=0, fails=0)
                 if self.tasks["discovery"]["state"] == "waiting":
                     self.tasks["discovery"]["state"] = "idle"
+                self.verify_pending_req = True     # 恢复后先核验「待核验」的安装结果
                 self._persist()
         self._wake.set()
         self._emit()
@@ -263,6 +280,9 @@ class Supervisor(object):
                 if kind == "discovery":
                     box["result"] = self._task_discovery(manual=True)
                     self._task_status(manual=True)
+                    j = self.E.job or {}
+                    if not j.get("running") and self.E.pending_items():
+                        box["result"]["verify"] = self.E.verify_pending(source="ui")
                 elif kind == "wifi_retry":
                     box["result"] = self._connect(arg, task="wifi_reconnect", manual=True)
                 elif kind == "physical":
@@ -297,6 +317,12 @@ class Supervisor(object):
             due_rec = [] if self.wifi_paused else [
                 t for t, r in self.reconnect.items()
                 if not r.get("gaveUp") and r["next"] <= now]
+        if self.verify_pending_req and self.devices_at is not None:
+            self.verify_pending_req = False
+            j = self.E.job or {}
+            if not j.get("running") and self.E.pending_items():
+                self.E.verify_pending(source="bg:verify")
+                self._emit()
         if due_disc:
             self._task_discovery()
         if due_status:
@@ -410,6 +436,9 @@ class Supervisor(object):
             peers = [x for x in groups.get(d.get("physical"), []) if x != d["serial"]]
             d["peers"] = peers
             d["duplicate"] = bool(peers)
+            if d["wireless"]:
+                # 只陈述能确认的事实：是不是本程序发起的连接。来源无法确定时不做归因。
+                d["origin"] = "ours" if d["serial"] in self.our_connects else "unknown"
         # 记住的无线地址掉线了 → 安排有限次重连
         hist = set(self.E.settings.get("wirelessHistory") or [])
         auto = self.E.settings.get("autoReconnect", True)

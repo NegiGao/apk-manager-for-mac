@@ -11,7 +11,7 @@
 """
 import os, subprocess, sys, threading, time, urllib.request, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import Inst, APKS
+from harness import Inst, APKS, REPO as REPO_DIR, HERE as HERE_DIR, SERVER_PY
 
 FAST = {"APKMGR_DISCOVERY_INTERVAL": "1", "APKMGR_RECONNECT_BACKOFF": "1,2,3"}
 USB = "FAKE1234567890"
@@ -347,14 +347,12 @@ def s9():
         t0 = time.time()
         I.post("/api/install", {"serial": USB, "mode": "all"})
         I.wait(lambda: job(I).get("current"), what="开始")
-        I.post("/api/supervisor/pause")       # 暂停后台不能杀掉正在进行的安装
         I.post("/api/install/pause")
         I.wait(lambda: job(I).get("paused"), timeout=20, what="暂停")
         j = job(I)
         check(j["pauseReason"] == "user" and j["ok"] == 1 and j["remaining"] == 2,
               "第一个装完才停（成功 %d，剩余 %d）" % (j["ok"], j["remaining"]))
         check(len([a for ts, a in I.adb_calls(t0) if "install" in a.split()]) == 1, "暂停后没有开始第二个")
-        I.post("/api/supervisor/resume")
         r = I.post("/api/install/continue", {})
         I.wait(lambda: any(e["type"] == "install_done" for e in I.events), timeout=60, what="完成")
         n = len([a for ts, a in I.adb_calls(t0) if "install" in a.split()])
@@ -383,7 +381,350 @@ def s9():
         I.close()
 
 
-ALL = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6, "7": s7, "8": s8, "9": s9}
+
+def items(I):
+    return {i["label"]: i for i in I.get("/api/state")["items"]}
+
+
+def disk_queue(I):
+    import json as _j
+    return {i["label"]: i for i in _j.load(open(os.path.join(I.home, ".apk-installer", "queue.json")))}
+
+
+def installs_of(I, pkg_file, since=0):
+    return [a for ts, a in I.adb_calls(since) if "install" in a.split() and a.endswith(pkg_file)]
+
+
+def s10():
+    print("\n[10] 慢安装中「暂停后台」：当前项装完但不核验、不开始下一项；结果保留；恢复后先核验，不重复安装")
+    I = Inst("s10", FAST)
+    try:
+        I.ctl(".install_delay", "2.5")
+        ready(I)
+        import_all(I)
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait(lambda: job(I).get("current"), what="开始")
+        time.sleep(0.5)
+        I.post("/api/supervisor/pause")
+        t_pause = time.time()
+        I.wait(lambda: job(I).get("paused"), timeout=20, what="暂停")
+        time.sleep(2)
+        j = job(I); it = items(I)
+        check(j["pauseReason"] == "bg_paused", "队列随后台一起暂停（原因 %s）" % j["pauseReason"])
+        check(it["Termux"]["status"] == "pending_verify" and it["Termux"]["code"] == "verify_pending",
+              "正在装的那一项装完了，但记为「待核验」而不是成功/失败/未安装（%s）" % it["Termux"]["status"])
+        lr = disk_queue(I)["Termux"].get("lastRun") or {}
+        check(lr.get("rc") == 0 and "Success" in (lr.get("log") or ""),
+              "adb 退出码与日志已写入磁盘上的队列（rc=%s）" % lr.get("rc"))
+        check(it["NewPipe"]["status"] == "pending", "没有开始下一项（NewPipe 状态 %s）" % it["NewPipe"]["status"])
+        after = [a for ts, a in I.adb_calls(t_pause + 0.05)]
+        check(not after, "暂停之后本程序没有再发任何 adb 命令（%d 条：%s）" % (len(after), after[:3]))
+        r = I.post("/api/install/continue", {})
+        check(not r["ok"] and r["code"] == "bg_paused_blocks_install", "后台暂停中不能继续安装（%s）" % r.get("code"))
+        t_res = time.time()
+        I.post("/api/supervisor/resume")
+        I.wait(lambda: items(I)["Termux"]["status"] == "success", timeout=20, what="恢复后核验")
+        q = [a for ts, a in I.adb_calls(t_res) if "pm path com.termux" in a]
+        check(q, "恢复后台后先到设备上核验了 Termux（%d 次查询）" % len(q))
+        check(job(I)["paused"] and not [a for ts, a in I.adb_calls(t_res) if "install" in a.split()],
+              "恢复后台不会自己继续安装")
+        I.post("/api/install/continue", {})
+        I.wait(lambda: any(e["type"] == "install_done" for e in I.events), timeout=60, what="完成")
+        check(len(installs_of(I, "termux.apk")) == 1, "Termux 全程只装了 1 次（没有因为丢结果而重装）")
+        check(len([a for ts, a in I.adb_calls(0) if "install" in a.split()]) == 3, "三个 APK 各装一次，共 3 次")
+    finally:
+        I.close()
+
+    print("    —— 恢复后核验时查询失败：保持「待核验」，继续安装也不重装它")
+    I = Inst("s10b", FAST)
+    try:
+        I.ctl(".install_delay", "2")
+        ready(I)
+        import_all(I, ("termux", "newpipe"))
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait(lambda: job(I).get("current"), what="开始")
+        time.sleep(0.4)
+        I.post("/api/supervisor/pause")
+        I.wait(lambda: job(I).get("paused"), timeout=20, what="暂停")
+        I.ctl(".shell_fail", "1")
+        I.post("/api/supervisor/resume")
+        time.sleep(3)
+        it = items(I)["Termux"]
+        check(it["status"] == "pending_verify", "查询失败时仍是「待核验」，没有被判成未安装（%s / %s）" % (it["status"], it["code"]))
+        I.ctl(".shell_fail")
+        t0 = time.time()
+        r = I.post("/api/install/continue", {})
+        I.wait(lambda: not job(I).get("running"), timeout=60, what="结束")
+        check(not installs_of(I, "termux.apk", t0), "继续安装时没有重复安装 Termux")
+        check(items(I)["Termux"]["status"] == "success", "设备恢复后核验通过，标为成功")
+    finally:
+        I.close()
+
+
+def s11():
+    print("\n[11] 迟到结果在写入前拦截：旧设备慢查询 → 暂停 → 换设备 → 恢复 → 旧结果最后返回")
+    I = Inst("s11", FAST)
+    try:
+        I.ctl(".extra_devices", "SECOND01\tdevice")
+        ready(I)
+        I.post("/api/import", {"path": APKS["termux"]})
+        I.preinstall("termux", "com.termux")
+        I.ctl(".slow_pm", "3")
+        I.post("/api/supervisor/select", {"serial": USB})
+        I.wait(lambda: [a for ts, a in I.adb_calls(0) if a.startswith("-s %s shell pm list" % USB)], what="旧设备开始慢查询")
+        I.post("/api/supervisor/pause")
+        I.ctl(".slow_pm")
+        I.post("/api/supervisor/select", {"serial": "SECOND01"})
+        t_switch = time.time()
+        I.post("/api/supervisor/resume")
+        I.wait(lambda: (items(I)["Termux"].get("installed") or {}).get("serial") == "SECOND01", timeout=20, what="新设备标记")
+        time.sleep(4)
+        late = [e for e in I.events if e["type"] == "marked" and e.get("serial") == USB and e["ts"] >= t_switch]
+        check(not late, "旧设备的结果没有在换设备之后写入（%d 次）" % len(late))
+        check(items(I)["Termux"]["installed"]["serial"] == "SECOND01", "内存里的标记属于新设备")
+        check(disk_queue(I)["Termux"]["installed"]["serial"] == "SECOND01", "磁盘上的队列也属于新设备")
+        check(I.sup()["tasks"]["status"]["note"] in ("", "late_discarded"), "状态查询任务记录为丢弃迟到结果或正常")
+    finally:
+        I.close()
+
+    print("    —— 手动「标记已安装」途中换设备")
+    I = Inst("s11b", FAST)
+    try:
+        I.ctl(".extra_devices", "SECOND01\tdevice")
+        ready(I)
+        I.post("/api/import", {"path": APKS["termux"]})
+        I.post("/api/supervisor/select", {"serial": USB}); time.sleep(1.5)
+        before = disk_queue(I)["Termux"].get("installed")
+        I.ctl(".slow_pm", "3")
+        res = {}
+        th = threading.Thread(target=lambda: res.update(I.post("/api/mark", {"serial": USB}))); th.start()
+        time.sleep(0.5); I.ctl(".slow_pm")
+        I.post("/api/supervisor/select", {"serial": "SECOND01"})
+        th.join()
+        check(res.get("code") == "late_discarded", "手动标记的结果被丢弃（%s）" % res.get("code") or res)
+        cur = (items(I)["Termux"].get("installed") or {}).get("serial")
+        check(cur != USB, "队列里没有旧设备的标记（现在：%s）" % cur)
+    finally:
+        I.close()
+
+
+def s12():
+    print("\n[12] 安装后核验绑定同一台设备；身份或查询不确定时不算成功、也不算未安装")
+    I = Inst("s12", FAST)
+    try:
+        ready(I)
+        I.post("/api/import", {"path": APKS["termux"]})
+        I.ctl(".fail_after_install", "1")
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait(lambda: any(e["type"] in ("install_done", "install_paused") for e in I.events), timeout=30, what="结束")
+        it = items(I)["Termux"]
+        check(it["status"] == "pending_verify", "装完后查询失败 → 待核验（%s / %s）" % (it["status"], it["code"]))
+        check(not it.get("installed") or it["installed"].get("state") != "none", "已安装标记没有被改成「没装过」")
+        I.ctl(".shell_fail"); I.ctl(".fail_after_install")
+        r = I.post("/api/supervisor/check")
+        check(items(I)["Termux"]["status"] == "success", "设备恢复后手动检测一次即完成核验 → 成功")
+    finally:
+        I.close()
+
+    I = Inst("s12b", FAST)
+    try:
+        I.ctl(".serialno_empty", "1")
+        I.ctl(".wireless", WIFI)
+        I.wait(lambda: I.sup()["devicesAt"] and len(I.sup()["devices"]) == 2, what="设备")
+        time.sleep(1.5)
+        I.post("/api/import", {"path": APKS["termux"]})
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait(lambda: any(e["type"] == "install_done" for e in I.events), timeout=30, what="USB 完成")
+        check(items(I)["Termux"]["code"] == "installed_verified", "USB 读不到序号时用 USB 序列号识别 → 已核验")
+        I.events.clear()
+        I.post("/api/install", {"serial": WIFI, "mode": "all"})
+        I.wait(lambda: any(e["type"] in ("install_done", "install_paused") for e in I.events), timeout=30, what="Wi-Fi 完成")
+        it = items(I)["Termux"]
+        check(it["status"] == "unverified" and it["code"] == "verify_identity_unknown",
+              "Wi-Fi 读不到序号 → 身份无法确认，不判成功（%s）" % it["code"])
+    finally:
+        I.close()
+
+    I = Inst("s12c", FAST)
+    try:
+        I.ctl(".wireless", WIFI)
+        ready(I)
+        import_all(I, ("termux", "newpipe"))
+        I.ctl(".swap_after_install", "1")
+        I.post("/api/install", {"serial": WIFI, "mode": "all"})
+        I.wait(lambda: job(I).get("paused"), timeout=30, what="暂停")
+        it = items(I)
+        check(it["Termux"]["status"] == "unverified" and it["Termux"]["code"] == "verify_identity_changed",
+              "装完后同一 Wi-Fi 地址背后换了手机 → 不拿另一台的版本判成功（%s）" % it["Termux"]["code"])
+        check(job(I)["pauseReason"] == "target_mismatch" and it["NewPipe"]["status"] == "pending",
+              "队列暂停，没有继续往新机器上装")
+    finally:
+        I.close()
+
+
+def s13():
+    print("\n[13] 取消只结束本程序自己的进程；设备结果查不到时显示待核验而不是「没装上」")
+    d = os.path.join(__import__("harness").SC, "extbin13")
+    os.makedirs(d, exist_ok=True)
+    fake = os.path.join(d, "adb")
+    open(fake, "w").write("#!/bin/bash\nsleep 120\n"); os.chmod(fake, 0o755)
+    ext = [subprocess.Popen([fake, "-L", "tcp:5037", "fork-server", "server", "--reply-fd", "4"]),
+           subprocess.Popen([fake, "-s", "OTHER", "install", "x.apk"])]
+    I = Inst("s13", FAST)
+    try:
+        I.ctl(".install_delay", "5")
+        ready(I)
+        I.post("/api/import", {"path": APKS["termux"]})
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait(lambda: job(I).get("current"), what="开始")
+        time.sleep(0.6)
+        pid = next((a["pid"] for a in I.sup()["active"] if "install" in a["cmd"]), None)
+        I.ctl(".shell_fail", "1")
+        I.post("/api/install/cancel-current")
+        I.wait(lambda: job(I).get("paused"), timeout=20, what="暂停")
+        time.sleep(0.5)
+        it = items(I)["Termux"]
+        check(it["status"] == "pending_verify", "取消后查询失败 → 待核验，不说「没装上」（%s / %s）" % (it["status"], it["code"]))
+        alive = pid and os.path.exists("/proc/%d" % pid) and open("/proc/%d/stat" % pid).read().split()[2] != "Z"
+        check(pid and not alive, "被取消的是本程序自己的 install 进程（PID %s），已结束且已回收" % pid)
+        check(all(p.poll() is None for p in ext), "外部 adb 服务和外部 install 进程都还活着")
+        src = "".join(open(os.path.join(REPO_DIR, f), encoding="utf-8").read() for f in
+                      ("core/engine.py", "core/adbkit.py", "core/supervisor.py", "core/server.py", "app.py"))
+        import re as _re
+        hits = _re.findall(r"""["']kill-server["']|["'](?:pkill|killall)["']|\bos\.kill\(|\bos\.killpg\(""", src)
+        check(not hits, "源码里没有作为命令出现的 kill-server / pkill / killall / os.kill（命中 %s）" % hits)
+        I.ctl(".shell_fail")
+        I.post("/api/supervisor/check")
+        it = items(I)["Termux"]
+        check(it["status"] == "cancelled" and it["code"] == "cancelled_not_installed",
+              "设备恢复后核验：确实没装上（%s）" % it["code"])
+    finally:
+        I.close()
+        for p in ext:
+            p.kill()
+
+
+def s14():
+    print("\n[14] 单实例：连点启动、锁被占用、旧版本仍在运行")
+    import tempfile, fcntl
+    def launch(home, n=1, code_dir=None, extra=None):
+        env = dict(os.environ, HOME=home, APKMGR_ADB=os.path.join(HERE_DIR, "fakeadb/adb"),
+                   APKMGR_BROWSER="/bin/true", FAKE_DEV_ROOT=os.path.join(home, "dev"),
+                   FAKE_ADB_LOG=os.path.join(home, "adb.log"))
+        env.update(extra or {})
+        return [subprocess.Popen([SERVER_PY, "app.py", "--app-mode"], cwd=code_dir or REPO_DIR, env=env,
+                                 stdout=open(os.path.join(home, "launch.log"), "a"), stderr=subprocess.STDOUT)
+                for _ in range(n)]
+    bad = 0
+    for r in range(10):
+        home = tempfile.mkdtemp()
+        ps = launch(home, 5)
+        time.sleep(2.5)
+        alive = sum(1 for p in ps if p.poll() is None)
+        bad += alive != 1
+        for p in ps: p.kill()
+    check(bad == 0, "10 轮 × 同时启动 5 个：每轮都只有 1 个后台服务（异常 %d 轮）" % bad)
+
+    home = tempfile.mkdtemp()
+    os.makedirs(os.path.join(home, ".apk-installer"), exist_ok=True)
+    fd = os.open(os.path.join(home, ".apk-installer", "instance.lock"), os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    p = launch(home)[0]
+    time.sleep(12)
+    check(p.poll() is not None and not os.path.exists(os.path.join(home, ".apk-installer", "port")),
+          "锁被占用且对方不响应时，不会再起第二个服务（进程已退出）")
+    os.close(fd)
+
+    old = os.environ.get("APKMGR_TEST_OLD_CODE")
+    if not old:
+        check(False, "未提供旧版本代码目录（APKMGR_TEST_OLD_CODE），跳过旧版本升级测试")
+        return
+    home = tempfile.mkdtemp()
+    po = launch(home, 1, code_dir=old)[0]
+    pf = os.path.join(home, ".apk-installer", "port")
+    for _ in range(100):
+        if os.path.exists(pf): break
+        time.sleep(0.1)
+    time.sleep(1)
+    pn = launch(home)[0]
+    time.sleep(6)
+    import urllib.request, json as _j
+    v = _j.load(urllib.request.urlopen("http://127.0.0.1:%s/api/ping" % open(pf).read().strip(), timeout=3))
+    check(po.poll() is not None and v.get("version") == "1.5.1",
+          "空闲的旧版本（1.5.0）被请求退出，新版本接管（现在运行 %s）" % v.get("version"))
+    for p in (po, pn): p.kill()
+
+    # 旧版本正在安装：不能把它关掉，新启动的进程把窗口交给它后自己退出
+    home = tempfile.mkdtemp()
+    os.makedirs(os.path.join(home, "dev"), exist_ok=True)
+    open(os.path.join(home, "dev", ".install_delay"), "w").write("8")
+    po = launch(home, 1, code_dir=old)[0]
+    pf = os.path.join(home, ".apk-installer", "port")
+    for _ in range(100):
+        if os.path.exists(pf): break
+        time.sleep(0.1)
+    time.sleep(2.5)
+    port = open(pf).read().strip()
+    def post(path, body):
+        rq = urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), data=_j.dumps(body).encode(),
+                                    headers={"Content-Type": "application/json"})
+        return _j.load(urllib.request.urlopen(rq, timeout=10))
+    post("/api/import", {"path": APKS["termux"]})
+    post("/api/install", {"serial": USB, "mode": "all"})
+    time.sleep(1)
+    pn = launch(home)[0]
+    time.sleep(4)
+    check(po.poll() is None and pn.poll() is not None,
+          "旧版本正在安装时不会被关掉；新启动的进程交给它后退出（旧进程%s，新进程%s）" % (
+              "仍在运行" if po.poll() is None else "已退出", "已退出" if pn.poll() is not None else "仍在运行"))
+    for p in (po, pn): p.kill()
+
+
+def s15():
+    print("\n[15] 暂停后：刷新页面 / 多窗口不会偷偷检测；新出现的无线连接只标「不是本程序发起」")
+    I = Inst("s15", FAST)
+    try:
+        ready(I)
+        I.post("/api/supervisor/pause")
+        time.sleep(1.2)
+        t0 = time.time()
+        for _ in range(15):
+            I.get("/api/state"); I.get("/api/supervisor"); I.get("/api/devices")
+        for _ in range(2):
+            threading.Thread(target=lambda: [None for _ in urllib.request.urlopen(I.B + "/api/events", timeout=6)],
+                             daemon=True).start()
+        time.sleep(6)
+        check(not I.adb_calls(t0), "暂停中刷新 45 次、开 2 个窗口：0 条 adb 命令（%d）" % len(I.adb_calls(t0)))
+        I.ctl(".wireless", "192.168.1.77:5555")        # 别的程序连上了一台无线设备
+        I.post("/api/supervisor/check")
+        d = next(x for x in I.sup()["devices"] if x["serial"] == "192.168.1.77:5555")
+        check(d.get("origin") == "unknown", "新出现的无线连接标为「不是本程序发起」（origin=%s）" % d.get("origin"))
+        check(not [a for ts, a in I.adb_calls(0) if "connect" in a.split()], "本程序从未发出 connect")
+    finally:
+        I.close()
+
+
+def s16():
+    print("\n[16] 暂停中手动「检测一次」只执行一次，不恢复自动循环")
+    I = Inst("s16", FAST)
+    try:
+        ready(I)
+        I.post("/api/supervisor/pause")
+        time.sleep(1.2)
+        t0 = time.time()
+        I.post("/api/supervisor/check")
+        t1 = time.time()
+        time.sleep(6)
+        n = [a for ts, a in I.adb_calls(t0) if "devices" in a.split()]
+        later = I.adb_calls(t1 + 0.05)
+        check(len(n) == 1, "只执行了 1 次 adb devices（%d）" % len(n))
+        check(not later, "之后 6 秒内没有任何 adb 命令（%d）" % len(later))
+        check(I.sup()["bgPaused"], "仍处于暂停")
+    finally:
+        I.close()
+
+ALL = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6, "7": s7, "8": s8, "9": s9,
+       "10": s10, "11": s11, "12": s12, "13": s13, "14": s14, "15": s15, "16": s16}
 if __name__ == "__main__":
     which = sys.argv[1:] or list(ALL)
     for k in which:

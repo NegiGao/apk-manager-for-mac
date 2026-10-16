@@ -34,8 +34,10 @@ no Node, no Xcode. The only external dependency is `adb`, which the app can down
 - Each job is **bound to one device** (connection + verified hardware serial). Unplug it and the
   queue pauses; plug in a different phone and nothing resumes on its own. It never falls back to the
   same phone's Wi-Fi entry or to another device.
-- Success is **verified on the device**: after `Success`, the app reads the package's version back
-  with `dumpsys` and flags a mismatch or a missing package as *unverified*.
+- Success is **verified on the device**: after `Success`, the app re-checks it's still the same device,
+  then reads the package back (`pm path` + `dumpsys`). A version mismatch or missing package is
+  *unverified*; if the device can't be queried or its identity can't be confirmed, the item stays
+  **awaiting verification** — a failed query is never reported as "not installed".
 - Save a named order ("new phone setup") and load it again on the next device.
 - Every result is explained: success with version and elapsed time, failures with the actual
   reason *and* what to do about it (signature clash → uninstall first; device has a newer
@@ -76,6 +78,13 @@ no Node, no Xcode. The only external dependency is `adb`, which the app can down
   **USB only** (installs go to that USB device only; no wireless scanning, reconnecting or `tcpip`
   for it; if USB drops the queue pauses).
 
+**Pause background & wait** means this app stops touching devices: the APK being installed is allowed
+to finish, but it isn't queried afterwards (it's marked *awaiting verification*, with adb's exit code
+and output kept) and the next one doesn't start. **Resume** verifies pending items first and never
+continues installing by itself; pending items are never reinstalled just because their result was
+unknown. **Cancel current** signals only this app's own `adb install` process (by PID) and then reads
+the device; if that read fails, the result is shown as unknown rather than "cancelled, not installed".
+
 All automatic adb activity runs on **one scheduler thread** in the backend, so refreshing the page,
 opening a second window or clicking Resume repeatedly never starts a second loop. Pausing is held by
 the backend and survives a reload. The app never runs `adb kill-server` and never ends a process it
@@ -98,8 +107,16 @@ macOS notification text.
    ```
 4. Closing the window quits the app (~25 s later; it never quits mid-install).
 
-Requires macOS 10.13+ and the system `python3`. If macOS says it's missing, run
-`xcode-select --install` once.
+Needs **Python 3.8 or newer**. macOS doesn't ship a usable Python on its own: `/usr/bin/python3` is a
+stub until Xcode Command Line Tools are installed (`xcode-select --install`, which currently brings
+3.9). Homebrew (`brew install python`) or the python.org installer work too. The launcher looks in
+those places by absolute path (Finder-launched apps don't get your terminal's `PATH`) and shows an
+alert if none is usable. Not yet verified on a real Mac — see [the acceptance checklist](docs/MAC_ACCEPTANCE.md)
+and `tools/mac_diagnose.sh` (read-only diagnostics).
+
+Only one copy runs at a time (a lock file decides; double-clicking again just re-opens the window).
+If an older version is still running and idle, it is asked to quit and the new one takes over; if
+it's busy installing, it's left alone.
 
 ### Phone setup (once)
 
@@ -172,14 +189,23 @@ interrupted mid-way, and an install that reports `Success` without actually land
 
 ```bash
 sh tests/get_test_apks.sh        # once: fetches 3 real open-source APKs into tests/apks/
-python3 tests/acceptance.py      # all scenarios (≈4 min)
-python3 tests/acceptance.py 5 9  # just some of them
+python3 tests/acceptance.py      # all 16 scenarios (≈8 min)
+python3 tests/acceptance.py 10 13  # just some of them
+APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # run the app under 3.9
+APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # keep adb command logs
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.1.zip --py39 /path/to/python3.9
 ```
 
-It covers: pausing the wireless background during a USB install, pausing during failing reconnects,
-one scheduler no matter how many windows or Resume clicks, USB + Wi-Fi to the same phone, unplugging
-mid-install, telling unauthorized / offline / connection-failed / paused apart, leaving other adb
-users alone, verifying installs on the device, and the install-queue pause boundary.
+`acceptance.py` covers: pausing the wireless background during a USB install; pausing during failing
+reconnects; one scheduler regardless of windows or Resume clicks; USB + Wi-Fi to the same phone;
+unplugging mid-install; unauthorized / offline / connection-failed / paused told apart; leaving
+other adb users alone; verifying installs on the device; the queue's pause boundary; pausing the
+background mid-install (pending verification, no reinstall); late results rejected before they are
+written; verification bound to the same device; cancelling only this app's process; a single
+instance under concurrent launches and old-version upgrades; no adb traffic while paused; and
+"Check once" running exactly once. `delivery_check.py` unpacks the release ZIP into a path with CJK
+characters and spaces and launches it with a Finder-like minimal environment, a read-only bundle,
+Python 3.9, a forced quit mid-install, and data from v1.4 / v1.5.0.
 
 ---
 
@@ -206,11 +232,11 @@ require "Install via USB" in Developer options.
 apps take a few minutes, and it's cached afterwards. "User-installed apps" is much faster than
 "All apps".
 
-**Wireless keeps coming back even though I paused it.** Newer adb servers auto-connect paired
-devices over mDNS on their own. That's the adb server, not this app — the console's pause only
-guarantees *this app* stops connecting. Turning the server's behaviour off needs the server
-restarted with `ADB_MDNS_AUTO_CONNECT=0`, which would also cut other programs' connections, so the
-app doesn't do it for you.
+**A wireless connection appears even though I paused the wireless background.** Pausing only
+guarantees that *this app* stops connecting. Other programs can connect devices, and the adb server
+itself can auto-connect devices that were paired before. The console can tell whether a connection
+was made by this app; when it wasn't, it says "not connected by this app (origin unknown)" and does
+not guess further. The app won't restart the shared adb server or change its settings for you.
 
 **An app won't uninstall.** Preinstalled system apps can't be removed this way; the app tells
 you when that's the reason.

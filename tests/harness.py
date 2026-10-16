@@ -1,11 +1,15 @@
 """验收测试用的公共工具：起一个隔离的服务实例（独立 HOME、独立假设备、独立 adb 日志）。"""
-import json, os, shutil, subprocess, tempfile, threading, time, urllib.request, socket
+import json, os, shutil, subprocess, sys, tempfile, threading, time, urllib.request, socket
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 FAKE_ADB = os.path.join(HERE, "fakeadb", "adb")
 SC = os.environ.get("APKMGR_TEST_WORK") or os.path.join(tempfile.gettempdir(), "apkmgr-tests")
 APK_DIR = os.environ.get("APKMGR_TEST_APKS") or os.path.join(HERE, "apks")
+# 被测服务用哪个 Python 跑（默认就是跑测试的这个），可以用来在 3.9 上验收
+SERVER_PY = os.environ.get("APKMGR_TEST_SERVER_PY") or sys.executable
+# 证据目录：每个实例结束时把 adb 命令记录、服务日志、队列/设置快照拷过去
+EVIDENCE = os.environ.get("APKMGR_TEST_EVIDENCE")
 APKS = {k: os.path.join(APK_DIR, v) for k, v in
         {"termux": "termux.apk", "newpipe": "newpipe.apk", "seal": "seal.apk"}.items()}
 for _p in APKS.values():
@@ -35,7 +39,8 @@ class Inst(object):
                     "FAKE_DEV_ROOT": self.dev, "FAKE_ADB_LOG": self.adblog})
         env.update(env_extra or {})
         self.env = env
-        self.proc = subprocess.Popen(["python3", "app.py", "--port", str(self.port), "--no-browser"],
+        self.name = name
+        self.proc = subprocess.Popen([SERVER_PY, "app.py", "--port", str(self.port), "--no-browser"],
                                      cwd=REPO, env=env, stdout=open(os.path.join(self.root, "srv.log"), "w"),
                                      stderr=subprocess.STDOUT)
         self.events = []
@@ -113,3 +118,14 @@ class Inst(object):
             self.proc.kill(); self.proc.wait(5)
         except Exception:
             pass
+        if EVIDENCE:
+            dst = os.path.join(EVIDENCE, self.name)
+            os.makedirs(dst, exist_ok=True)
+            for src, nm in ((self.adblog, "adb-commands.log"), (os.path.join(self.root, "srv.log"), "server.log"),
+                            (os.path.join(self.home, ".apk-installer", "queue.json"), "queue.json"),
+                            (os.path.join(self.home, ".apk-installer", "settings.json"), "settings.json")):
+                if os.path.exists(src):
+                    shutil.copyfile(src, os.path.join(dst, nm))
+            with open(os.path.join(dst, "events.jsonl"), "w") as f:
+                for e in self.events:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")

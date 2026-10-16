@@ -186,6 +186,13 @@ class Engine(object):
             self.settings.setdefault(k, v)
         self.items = [i for i in self._read_json(QUEUE_FILE, [])
                       if self._item_alive(i)]
+        for it in self.items:
+            if it.get("status") == "installing":
+                # 上次在安装途中退出：设备上可能装上了也可能没有，下次先核验
+                it.update(status="pending_verify", code="verify_pending", arg="interrupted",
+                          pendingOn=it.get("installingOn"))
+            elif it.get("status") == "waiting":
+                it["status"] = "pending"
         self.label_cache = self._read_json(LABEL_CACHE_FILE, {})
 
     @staticmethod
@@ -588,6 +595,10 @@ class Engine(object):
             marks, counts = self.compute_marks(serial)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        # 迟到结果在写入前拦截：查询期间界面已经换成别的设备 → 丢弃，不写队列、不落盘
+        sel = self.sup.selected
+        if sel and not self._same_device(sel, serial):
+            return {"ok": False, "code": "late_discarded"}
         total = self.apply_marks(serial, marks, counts)
         return {"ok": True, "count": total, "counts": counts}
 
@@ -640,33 +651,60 @@ class Engine(object):
         return {"ok": True, "results": results}
 
     # -- 安装 -----------------------------------------------------------
-    # 一次安装任务（job）绑定一台设备：开始时记下它的连接标识和物理序号，
-    # 每装下一个之前都核对一遍。拔线 / 换成别的机器 → 队列暂停，绝不自动续装、
-    # 也不会悄悄改用同一台手机的 Wi-Fi 入口或其他设备。
+    # 一次安装任务（job）绑定一台设备：开始时记下连接标识和身份（物理序号；
+    # USB 连接读不到序号时用 USB 序列号；Wi-Fi 连接读不到序号则身份未知）。
+    # 每装下一个之前、每次核验之前都重新核对。拔线 / 换成别的机器 → 队列暂停，
+    # 绝不自动续装，也不会改走同一台手机的 Wi-Fi 入口或其他设备。
+    #
+    # 和「暂停后台」的关系：暂停后台 = 本程序不再主动碰设备。正在执行的那一次
+    # adb install 不打断，让它跑完；但不再发核验查询，结果记为「待核验」，
+    # 也不开始下一项。恢复后台后先核验，核验不出来的绝不重复安装。
     def _job_public(self):
         j = self.job or {}
         return {k: j.get(k) for k in (
-            "running", "paused", "pauseReason", "pauseAfterCurrent", "finished",
-            "serial", "physical", "name", "total", "done", "ok", "failed", "skipped",
-            "unverified", "current", "currentLabel", "remaining", "startedAt")}
+            "running", "paused", "pauseReason", "pauseAfterCurrent", "pendingReason",
+            "finished", "serial", "physical", "identityKind", "name", "total", "done",
+            "ok", "failed", "skipped", "unverified", "pending", "current", "currentLabel",
+            "remaining", "startedAt")}
 
-    def _target_check(self, serial, physical):
-        """返回 None 表示目标设备在线且就是当初那台；否则返回原因代码。"""
+    def _identity(self, serial):
+        """返回 (状态, 身份, 类型)。
+        状态: ok / lost（设备不在）/ error（读取失败，暂时无法确认——不等于换了设备）
+        类型: serialno / usb / unknown"""
         with self.adb.source("install"):
-            st = self.adb.get_state(serial)
-            if st != "device":
-                return "target_lost"
-            if physical and physical != serial:
-                now = self.adb.physical_serial(serial)
-                if now and now != physical:
-                    return "target_mismatch"
+            if self.adb.get_state(serial) != "device":
+                return "lost", None, None
+            sn = self.adb.read_serialno(serial)
+        if sn["state"] == "error":
+            return "error", None, None
+        if sn["state"] == "ok":
+            return "ok", sn["value"], "serialno"
+        if not self.adb.is_wireless_serial(serial):
+            return "ok", "usb:" + serial, "usb"      # USB 序列号本身就能标识这台机器
+        return "ok", None, "unknown"                  # Wi-Fi 地址不能代表身份
+
+    def _target_check(self, job):
+        """None = 目标在线且仍是原来那台（或身份本来就无法确认）；否则返回原因代码。"""
+        st, ident, kind = self._identity(job["serial"])
+        if st == "lost":
+            return "target_lost"
+        if st == "error":
+            return "target_unconfirmed"               # 读不到身份：先停下，不猜
+        if job.get("physical") and ident != job["physical"]:
+            return "target_mismatch"
         return None
 
     def _remaining_ids(self, job):
+        """继续安装时要装的项：没成功、没跳过、也不是「待核验」（待核验的绝不重复安装）。"""
         with self.lock:
             idx = {it["id"]: it for it in self.items}
             return [i for i in job["order"]
-                    if i in idx and idx[i].get("status") not in ("success", "skipped")]
+                    if i in idx and idx[i].get("status") not in ("success", "skipped", "pending_verify")]
+
+    def _pending_ids(self, job):
+        with self.lock:
+            idx = {it["id"]: it for it in self.items}
+            return [i for i in job["order"] if i in idx and idx[i].get("status") == "pending_verify"]
 
     def start_install(self, serial, only_ids=None, mode=None):
         """mode: None=自动判断（有已完成记录时先问）；"remaining"=只装没装成的；"all"=全部重装。"""
@@ -675,31 +713,34 @@ class Engine(object):
                 return {"ok": False, "code": "busy_install"}
         if not serial:
             return {"ok": False, "code": "need_target"}
+        if self.sup.bg_paused:
+            return {"ok": False, "code": "bg_paused_blocks_install"}
         uo = self.sup.usb_only
         if uo and serial != uo["serial"]:
             return {"ok": False, "code": "usb_only_locked", "arg": uo.get("name")}
-        problem = None
-        with self.adb.source("install"):
-            if self.adb.get_state(serial) != "device":
-                problem = "target_not_ready"
-        if problem:
-            return {"ok": False, "code": problem}
-        physical = self.sup.physical_of(serial)
-        if not physical:
-            with self.adb.source("install"):
-                physical = self.adb.physical_serial(serial)
+        st, ident, kind = self._identity(serial)
+        if st == "lost":
+            return {"ok": False, "code": "target_not_ready"}
+        if st == "error":
+            return {"ok": False, "code": "target_unconfirmed"}
+        # 还有「待核验」的项：先核验（只核验绑定设备在线且身份一致的），核验不出来的不会被重复安装
+        if self.pending_items():
+            self.verify_pending(source="install")
         with self.lock:
             pool = [it for it in self.items if not only_ids or it["id"] in set(only_ids)]
             if not pool:
                 return {"ok": False, "code": "queue_empty"}
             done_here = [it for it in pool if it.get("status") == "success"
-                         and physical and it.get("doneOn") == physical]
-            if mode is None and done_here:
+                         and ident and it.get("doneOn") == ident]
+            pending_here = [it for it in pool if it.get("status") == "pending_verify"]
+            if mode is None and (done_here or pending_here):
                 return {"ok": False, "code": "choose_mode", "done": len(done_here),
-                        "remaining": len(pool) - len(done_here)}
+                        "pending": len(pending_here),
+                        "remaining": len(pool) - len(done_here) - len(pending_here)}
             if mode == "remaining":
                 pool = [it for it in pool if not (it.get("status") == "success"
-                                                  and it.get("doneOn") == physical)]
+                                                  and it.get("doneOn") == ident)
+                        and it.get("status") != "pending_verify"]
                 if not pool:
                     return {"ok": False, "code": "nothing_remaining"}
             for it in pool:
@@ -709,10 +750,11 @@ class Engine(object):
             dev = next((d for d in self.sup.devices if d["serial"] == serial), {})
             self.job = {
                 "running": True, "paused": False, "pauseReason": None,
-                "pauseAfterCurrent": False, "finished": False,
-                "serial": serial, "physical": physical, "name": dev.get("name") or serial,
+                "pauseAfterCurrent": False, "pendingReason": None, "finished": False,
+                "serial": serial, "physical": ident, "identityKind": kind,
+                "name": dev.get("name") or serial,
                 "order": [it["id"] for it in pool], "total": len(pool),
-                "done": 0, "ok": 0, "failed": 0, "skipped": 0, "unverified": 0,
+                "done": 0, "ok": 0, "failed": 0, "skipped": 0, "unverified": 0, "pending": 0,
                 "current": None, "currentLabel": None, "remaining": len(pool),
                 "startedAt": time.time(), "results": [], "cancelReq": None,
             }
@@ -720,12 +762,17 @@ class Engine(object):
         threading.Thread(target=self._install_worker, args=(self.job,), daemon=True).start()
         return {"ok": True}
 
-    def pause_after_current(self):
+    def _same_ident(self, job, serial, ident):
+        return serial == job.get("serial") or (ident and ident == job.get("physical"))
+
+    def pause_after_current(self, reason="user"):
         with self.lock:
             j = self.job
             if not j or not j.get("running"):
                 return {"ok": False, "code": "no_running_job"}
             j["pauseAfterCurrent"] = True
+            if not j.get("pendingReason") or reason == "bg_paused":
+                j["pendingReason"] = reason
         self._emit_job()
         return {"ok": True}
 
@@ -734,59 +781,97 @@ class Engine(object):
         return self.pause_after_current()
 
     def continue_install(self, rebind_serial=None):
-        """继续剩余队列。和「恢复后台」是两回事：这里只有用户点了才会继续装。"""
+        """继续剩余队列。和「恢复后台」是两回事：只有用户点了才会继续装。"""
         with self.lock:
             j = self.job
             if not j:
                 return {"ok": False, "code": "no_job"}
             if j.get("running"):
                 return {"ok": False, "code": "busy_install"}
-        remaining = self._remaining_ids(j)
-        if not remaining:
-            return {"ok": False, "code": "nothing_remaining"}
-        serial, physical = j["serial"], j.get("physical")
+        if self.sup.bg_paused:
+            return {"ok": False, "code": "bg_paused_blocks_install"}
+        serial = j["serial"]
         if rebind_serial and rebind_serial != serial:
             # 用户明确选择改装到另一台：重新绑定（界面上会先确认）
             uo = self.sup.usb_only
             if uo and rebind_serial != uo["serial"]:
                 return {"ok": False, "code": "usb_only_locked", "arg": uo.get("name")}
-            with self.adb.source("install"):
-                if self.adb.get_state(rebind_serial) != "device":
-                    return {"ok": False, "code": "target_not_ready"}
-                physical = self.sup.physical_of(rebind_serial) or \
-                    self.adb.physical_serial(rebind_serial)
-            serial = rebind_serial
+            st, ident, kind = self._identity(rebind_serial)
+            if st != "ok":
+                return {"ok": False, "code": "target_not_ready" if st == "lost" else "target_unconfirmed"}
+            with self.lock:
+                # 「待核验」的项属于原来那台设备，换设备后不能沿用
+                for iid in self._pending_ids(j):
+                    it = next((x for x in self.items if x["id"] == iid), None)
+                    if it:
+                        it.update(status="pending", code=None, arg="")
+                j.update(serial=rebind_serial, physical=ident, identityKind=kind)
         else:
-            why = self._target_check(serial, physical)
+            why = self._target_check(j)
             if why:
                 return {"ok": False, "code": "bound_" + why, "arg": j.get("name")}
+            # 先核验「待核验」的项，确认装上了的就不再装
+            if self.pending_items():
+                self.verify_pending(source="install")
+        remaining = self._remaining_ids(j)
+        still_pending = len(self._pending_ids(j))
+        if not remaining:
+            return {"ok": False, "code": "nothing_remaining", "pending": still_pending}
         with self.lock:
-            dev = next((d for d in self.sup.devices if d["serial"] == serial), {})
-            j.update(serial=serial, physical=physical, running=True, paused=False,
-                     pauseReason=None, pauseAfterCurrent=False, finished=False,
-                     name=dev.get("name") or j.get("name") or serial)
-            j["order"] = remaining
+            dev = next((d for d in self.sup.devices if d["serial"] == j["serial"]), {})
+            j.update(running=True, paused=False, pauseReason=None, pauseAfterCurrent=False,
+                     pendingReason=None, finished=False, cancelReq=None,
+                     name=dev.get("name") or j.get("name") or j["serial"])
+            j["order"] = remaining + self._pending_ids(j)
             for iid in remaining:
                 it = next((x for x in self.items if x["id"] == iid), None)
                 if it:
                     it["status"] = "waiting"
         threading.Thread(target=self._install_worker, args=(j,), daemon=True).start()
-        return {"ok": True, "remaining": len(remaining)}
+        return {"ok": True, "remaining": len(remaining), "pending": still_pending}
 
     def cancel_current(self):
-        """取消正在装的那一个。只结束本程序自己启动的 adb install 进程，事后核验设备上的真实结果。"""
+        """取消正在装的那一个。只对本程序自己启动的那个 adb install 进程（按 PID）发信号，
+        不按名字杀进程、不碰 adb 服务；事后去设备上核验实际结果。"""
         with self.lock:
             j = self.job
             if not j or not j.get("running") or not j.get("current"):
                 return {"ok": False, "code": "no_running_job"}
             j["cancelReq"] = j["current"]
             j["pauseAfterCurrent"] = True
+            j["pendingReason"] = "cancelled"
             proc = self.cur_proc
         if proc is not None:
             try:
-                proc.terminate()
+                proc.terminate()            # Popen 句柄：只发给这个 PID；已结束则什么都不做
             except Exception:
                 pass
+
+            def reap():                     # 5 秒内没退出再强制结束，确保不留孤儿进程
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            threading.Thread(target=reap, daemon=True).start()
+        return {"ok": True}
+
+    def quit_check(self, force=False):
+        """退出前检查。安装进行中默认拒绝；用户确认强制退出时，把当前项记为「待核验」。"""
+        j = self.job or {}
+        if j.get("running") and not force:
+            return {"ok": False, "code": "busy_install"}
+        if j.get("running"):
+            with self.lock:
+                for it in self.items:
+                    if it.get("status") == "installing":
+                        it.update(status="pending_verify", code="verify_pending", arg="quit",
+                                  pendingOn=it.get("installingOn"))
+                    elif it.get("status") == "waiting":
+                        it["status"] = "pending"
+                self.save_queue()
         return {"ok": True}
 
     def _flags(self):
@@ -810,8 +895,10 @@ class Engine(object):
     def _pause_job(self, job, reason):
         with self.lock:
             job.update(running=False, paused=True, pauseReason=reason,
-                       current=None, currentLabel=None, pauseAfterCurrent=False)
+                       current=None, currentLabel=None, pauseAfterCurrent=False,
+                       pendingReason=None)
             job["remaining"] = len(self._remaining_ids(job))
+            job["pending"] = len(self._pending_ids(job))
             for it in self.items:
                 if it["id"] in job["order"] and it.get("status") == "waiting":
                     it["status"] = "pending"
@@ -823,21 +910,70 @@ class Engine(object):
             notify_mac(notify_text(lang, "paused"), job.get("name") or job["serial"],
                        sound=self.settings.get("sound", True))
 
+    def _record(self, job, item, result):
+        """把一项的结果写进队列（含 adb 退出码和日志尾巴），并更新计数。"""
+        serial = job["serial"]
+        with self.lock:
+            prev = item.get("status")
+            item["status"] = result["status"]
+            item["code"] = result.get("code")
+            item["arg"] = result.get("arg") or ""
+            if "rc" in result:
+                item["lastRun"] = {"rc": result.get("rc"), "log": result.get("detail", "")[-800:],
+                                   "at": time.time(), "serial": serial}
+            if result["status"] == "success" and job.get("physical"):
+                item["doneOn"] = job["physical"]
+            if result.get("wasCancel"):
+                item["wasCancel"] = True
+            if result["status"] != "pending_verify":
+                item.pop("wasCancel", None)
+            if result["status"] == "pending_verify":
+                item["pendingOn"] = item.get("installingOn") or {
+                    "serial": serial, "physical": job.get("physical"),
+                    "identityKind": job.get("identityKind"), "name": job.get("name")}
+            else:
+                item.pop("pendingOn", None)
+            # 只有「查询成功」时才更新已安装标记；查询失败不能把标记改成「没装」
+            if result.get("q") in ("present", "absent"):
+                if result["q"] == "absent":
+                    item["installed"] = {"state": "none", "serial": serial}
+                else:
+                    dvc, mine = result.get("devVc"), item.get("versionCode")
+                    st = ("same" if dvc == mine else "update" if (mine and dvc is not None and dvc < mine)
+                          else "downgrade" if (mine and dvc is not None) else "unknown")
+                    item["installed"] = {"state": st, "versionCode": dvc,
+                                         "versionName": result.get("devVn"), "serial": serial}
+            if prev != "pending_verify":
+                job["done"] += 1
+                job["remaining"] = max(0, job["remaining"] - 1)
+            else:
+                job["pending"] = max(0, job.get("pending", 0) - 1)
+            key = {"success": "ok", "skipped": "skipped", "unverified": "unverified",
+                   "pending_verify": "pending"}.get(result["status"], "failed")
+            job[key] = job.get(key, 0) + 1
+            job["results"].append(result)
+            self.save_queue()
+        self.bus.emit("item", id=item["id"], status=result["status"],
+                      code=result.get("code"), arg=result.get("arg"),
+                      installed=item.get("installed"), seconds=result.get("seconds"),
+                      index=result.get("index"), total=job["total"],
+                      progress={k: job.get(k, 0) for k in ("done", "ok", "failed", "skipped",
+                                                           "unverified", "pending", "total")})
+
     def _install_worker(self, job):
         flags = self._flags()
-        serial, physical = job["serial"], job.get("physical")
         order = list(job["order"])
-        self.bus.emit("install_start", serial=serial, total=job["total"])
+        self.bus.emit("install_start", serial=job["serial"], total=job["total"])
         self._emit_job()
         idx_map = {it["id"]: it for it in self.items}
         for item_id in order:
             item = idx_map.get(item_id)
-            if item is None or item.get("status") in ("success", "skipped"):
+            if item is None or item.get("status") in ("success", "skipped", "pending_verify"):
                 continue
             if job.get("pauseAfterCurrent"):
-                self._pause_job(job, "user" if not job.get("cancelReq") else "cancelled")
+                self._pause_job(job, job.get("pendingReason") or "user")
                 return
-            why = self._target_check(serial, physical)
+            why = self._target_check(job)
             if why:
                 self._pause_job(job, why)
                 return
@@ -845,44 +981,19 @@ class Engine(object):
                 job["current"] = item_id
                 job["currentLabel"] = item.get("label") or item.get("file")
                 item["status"] = "installing"
+                item["installingOn"] = {"serial": job["serial"], "physical": job.get("physical"),
+                                        "identityKind": job.get("identityKind"),
+                                        "name": job.get("name")}
+                self.save_queue()
             self.bus.emit("item", id=item_id, status="installing",
                           index=job["done"] + 1, total=job["total"])
             self._emit_job()
 
             t0 = time.time()
-            result = self._install_one(serial, item, flags, job)
+            result = self._install_one(job, item, flags)
             result["seconds"] = round(time.time() - t0, 1)
             result["index"] = job["done"] + 1
-
-            with self.lock:
-                item["status"] = result["status"]
-                item["code"] = result.get("code")
-                item["arg"] = result.get("arg") or ""
-                if result["status"] == "success" and physical:
-                    item["doneOn"] = physical
-                # 核验时已经读到了设备上的真实版本，直接拿来更新「已安装」标记
-                if "devVc" in result:
-                    dvc, mine = result["devVc"], item.get("versionCode")
-                    if dvc is None:
-                        item["installed"] = {"state": "none", "serial": serial}
-                    else:
-                        st = ("same" if dvc == mine else "update" if mine and dvc < mine
-                              else "downgrade" if mine else "unknown")
-                        item["installed"] = {"state": st, "versionCode": dvc,
-                                             "versionName": result.get("devVn"), "serial": serial}
-                job["done"] += 1
-                key = {"success": "ok", "skipped": "skipped",
-                       "unverified": "unverified"}.get(result["status"], "failed")
-                job[key] += 1
-                job["results"].append(result)
-                job["remaining"] = max(0, job["remaining"] - 1)
-                self.save_queue()
-            self.bus.emit("item", id=item_id, status=result["status"],
-                          code=result.get("code"), arg=result.get("arg"),
-                          installed=item.get("installed"),
-                          seconds=result["seconds"], index=result["index"], total=job["total"],
-                          progress={k: job[k] for k in ("done", "ok", "failed", "skipped",
-                                                        "unverified", "total")})
+            self._record(job, item, result)
             if self.settings.get("notify") and result["status"] in ("success", "failed"):
                 lang = self.settings.get("lang") or "zh"
                 label = item.get("label") or item.get("file")
@@ -892,24 +1003,35 @@ class Engine(object):
                 else:
                     notify_mac("%s (%d/%d)" % (notify_text(lang, "fail"), result["index"], job["total"]),
                                label)
-            if result["status"] == "cancelled" or result["status"] == "cancel_installed":
+            if result.get("identity") == "changed":
+                self._pause_job(job, "target_mismatch")
+                return
+            if result.get("identity") == "lost":
+                self._pause_job(job, "target_lost")
+                return
+            if job.get("cancelReq") == item_id:
                 self._pause_job(job, "cancelled")
                 return
             if result["status"] == "failed" and self.settings.get("stopOnError"):
                 self._pause_job(job, "error")
                 return
 
+        if job.get("pauseAfterCurrent") and self._pending_ids(job):
+            self._pause_job(job, job.get("pendingReason") or "user")
+            return
         with self.lock:
             job.update(running=False, finished=True, paused=False, current=None,
-                       currentLabel=None, endedAt=time.time())
+                       currentLabel=None, endedAt=time.time(), pauseAfterCurrent=False)
             self.save_queue()
-        try:
-            with self.adb.source("install"):
-                self.mark_installed(serial)
-        except Exception:
-            pass
+        if not self.sup.bg_paused:
+            try:
+                with self.adb.source("install"):
+                    self.mark_installed(job["serial"])
+            except Exception:
+                pass
         self.bus.emit("install_done", ok=job["ok"], failed=job["failed"],
                       skipped=job["skipped"], unverified=job["unverified"],
+                      pending=job.get("pending", 0),
                       total=job["total"], seconds=round(time.time() - job["startedAt"], 1),
                       results=job["results"])
         self._emit_job()
@@ -919,7 +1041,104 @@ class Engine(object):
                        notify_text(lang, "summary") % (job["ok"], job["failed"]),
                        sound=self.settings.get("sound", True))
 
-    def _install_one(self, serial, item, flags, job):
+    # -- 核验 -----------------------------------------------------------
+    def _verify(self, job, item, cancelled=False):
+        """到设备上核验一项的实际结果。先确认还是同一台设备，再三态查询。
+        返回要写入的结果字段；任何「确认不了」的情况都不会被说成成功或没装。"""
+        pkg, mine = item.get("package"), item.get("versionCode")
+        out = {}
+        st, ident, kind = self._identity(job["serial"])
+        if st == "lost":
+            out.update(status="pending_verify", code="verify_pending", arg="target_lost",
+                       identity="lost")
+            return out
+        if st == "error":
+            out.update(status="pending_verify", code="verify_query_failed", arg="identity")
+            return out
+        if job.get("physical") and ident != job["physical"]:
+            out.update(status="unverified", code="verify_identity_changed", arg="",
+                       identity="changed")
+            return out
+        if not ident:
+            out.update(status="unverified", code="verify_identity_unknown", arg="")
+            return out
+        if not pkg:
+            out.update(status="unverified", code="verify_no_package", arg="")
+            return out
+        with self.adb.source("install"):
+            q = self.adb.query_package(job["serial"], pkg)
+        out["q"] = q["state"]
+        if q["state"] == "error":
+            out.update(status="pending_verify", code="verify_query_failed", arg=q.get("err", ""))
+            return out
+        if q["state"] == "absent":
+            out.update(devVc=None, devVn=None)
+            if cancelled:
+                out.update(status="cancelled", code="cancelled_not_installed", arg="")
+            else:
+                out.update(status="unverified", code="verify_missing", arg="")
+            return out
+        out.update(devVc=q.get("vc"), devVn=q.get("vn"))
+        if mine is not None and q.get("vc") == mine:
+            if cancelled:
+                out.update(status="cancel_installed", code="cancel_but_installed",
+                           arg=q.get("vn") or str(q.get("vc")))
+            else:
+                out.update(status="success", code="installed_verified",
+                           arg=q.get("vn") or item.get("versionName") or "")
+            return out
+        if cancelled:
+            out.update(status="cancelled", code="cancelled_kept_old",
+                       arg=q.get("vn") or str(q.get("vc")))
+        else:
+            out.update(status="unverified", code="verify_mismatch",
+                       arg="%s ≠ %s" % (q.get("vc"), mine))
+        return out
+
+    def pending_items(self):
+        with self.lock:
+            return [it for it in self.items if it.get("status") == "pending_verify"]
+
+    def verify_pending(self, source="bg:verify"):
+        """核验所有「待核验」的项（恢复后台后、继续安装前、启动时）。
+        每一项按它自己记录的绑定设备核验；设备不在 / 身份对不上 / 查询失败 → 保持待核验。"""
+        j = self.job
+        if j and j.get("running"):
+            return {"ok": False, "code": "busy_install"}
+        items = self.pending_items()
+        if not items:
+            return {"ok": True, "checked": 0, "resolved": 0, "pending": 0}
+        resolved = 0
+        for item in items:
+            if self.sup.bg_paused:
+                break
+            b = item.get("pendingOn") or {}
+            if not b.get("serial"):
+                continue                              # 不知道装在哪台设备上，没法核验
+            if j and item["id"] in j.get("order", []) and j.get("serial") == b["serial"]:
+                ctx = j
+            else:
+                ctx = {"serial": b["serial"], "physical": b.get("physical"),
+                       "identityKind": b.get("identityKind"), "name": b.get("name"),
+                       "done": 0, "ok": 0, "failed": 0, "skipped": 0, "unverified": 0,
+                       "pending": 1, "remaining": 0, "total": 0, "results": []}
+            r = dict(id=item["id"], label=item.get("label"), package=item.get("package"))
+            with self.adb.source(source):
+                r.update(self._verify(ctx, item, cancelled=bool(item.get("wasCancel"))))
+            if r["status"] != "pending_verify":
+                resolved += 1
+                self._record(ctx, item, r)
+        left = len(self.pending_items())
+        if j:
+            with self.lock:
+                j["pending"] = len(self._pending_ids(j))
+                j["remaining"] = len(self._remaining_ids(j))
+        self.save_queue()
+        self._emit_job()
+        return {"ok": True, "checked": len(items), "resolved": resolved, "pending": left}
+
+    def _install_one(self, job, item, flags):
+        serial = job["serial"]
         base = {"id": item["id"], "label": item.get("label"), "package": item.get("package")}
         parts = item.get("parts") or [item["path"]]
         parts = [p for p in parts if os.path.exists(p)]
@@ -929,9 +1148,12 @@ class Engine(object):
         pkg = item.get("package")
         if pkg and self.settings.get("skipSameVersion"):
             with self.adb.source("install"):
-                vn, vc = self.adb.installed_version(serial, pkg)
-            if vc is not None and item.get("versionCode") is not None and vc >= item["versionCode"]:
-                return dict(base, status="skipped", code="already_current", arg=str(vn or vc))
+                q = self.adb.query_package(serial, pkg)
+            if q["state"] == "present" and q.get("vc") is not None and \
+                    item.get("versionCode") is not None and q["vc"] >= item["versionCode"]:
+                return dict(base, status="skipped", code="already_current",
+                            arg=str(q.get("vn") or q["vc"]), q="present",
+                            devVc=q["vc"], devVn=q.get("vn"))
 
         lines = []
 
@@ -942,48 +1164,33 @@ class Engine(object):
         def on_proc(proc):
             self.cur_proc = proc
 
+        rc = None
         try:
             with self.adb.source("install"):
-                code, out = self.adb.install(serial, parts, on_line=on_line, flags=flags,
-                                             on_proc=on_proc)
+                rc, out = self.adb.install(serial, parts, on_line=on_line, flags=flags,
+                                           on_proc=on_proc)
         except AdbError as exc:
             return dict(base, status="failed", code="adb_error", arg=str(exc))
         except Exception as exc:
             return dict(base, status="failed", code="exec_error", arg=str(exc))
         finally:
             self.cur_proc = None
-
-        # 用户点了「取消当前」：不猜结果，读设备上的真实状态
-        if job.get("cancelReq") == item["id"]:
-            vn, vc = (None, None)
-            if pkg:
-                with self.adb.source("install"):
-                    vn, vc = self.adb.installed_version(serial, pkg)
-            if vc is not None and vc == item.get("versionCode"):
-                return dict(base, status="cancel_installed", code="cancel_but_installed",
-                            arg=vn or str(vc), devVc=vc, devVn=vn)
-            return dict(base, status="cancelled", code="cancelled_not_installed", arg="",
-                        **({"devVc": vc, "devVn": vn} if pkg else {}))
-
         text = out or "\n".join(lines)
-        if re.search(r"\bSuccess\b", text) and code == 0:
-            # 不只看日志里的 Success：读设备上的包名和版本确认
-            if not pkg or item.get("versionCode") is None:
-                return dict(base, status="success", code="installed",
-                            arg=item.get("versionName") or "", verified=False)
-            with self.adb.source("install"):
-                vn, vc = self.adb.installed_version(serial, pkg)
-            dev = {"devVc": vc, "devVn": vn}
-            if vc == item.get("versionCode"):
-                return dict(base, status="success", code="installed_verified",
-                            arg=vn or item.get("versionName") or "", verified=True, **dev)
-            if vc is None:
-                return dict(base, status="unverified", code="verify_missing", arg="", **dev)
-            return dict(base, status="unverified", code="verify_mismatch",
-                        arg="%s ≠ %s" % (vc, item.get("versionCode")), **dev)
-        code_name, extra = explain_failure(text)
-        return dict(base, status="failed", code=code_name, arg=extra,
-                    detail=text[-600:] if text else "")
+        run = {"rc": rc, "detail": text[-800:] if text else ""}   # 退出码与日志始终保留
+
+        cancelled = job.get("cancelReq") == item["id"]
+        if cancelled:
+            run["wasCancel"] = True
+        said_ok = bool(re.search(r"\bSuccess\b", text)) and rc == 0
+        if not said_ok and not cancelled:
+            code_name, extra = explain_failure(text)
+            return dict(base, **run, status="failed", code=code_name, arg=extra)
+        # 到这里：adb 报告成功，或用户取消了 —— 都需要去设备上核验。
+        # 后台已暂停 = 本程序不再主动碰设备：不发核验查询，记为「待核验」。
+        if self.sup.bg_paused:
+            return dict(base, **run, status="pending_verify", code="verify_pending",
+                        arg="cancel" if cancelled else "bg_paused")
+        return dict(base, **run, **self._verify(job, item, cancelled=cancelled))
 
     # -- 设备应用枚举 ----------------------------------------------------
     def start_app_scan(self, serial, scope="third", with_icons=True):

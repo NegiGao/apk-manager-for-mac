@@ -8,6 +8,11 @@
   $ROOT/.wifi_phone         内容为物理序号 → 无线地址背后换成了另一台手机
   $ROOT/.install_delay      安装耗时（秒），用来测试安装中途拔线 / 取消
   $ROOT/.verify_lie         存在 → 安装报 Success 但设备上实际没写入（测试核验）
+  $ROOT/.shell_fail         存在 → 所有 shell 命令失败（模拟查询出错，而不是「没装」）
+  $ROOT/.fail_after_install 存在 → 安装成功后立刻让后续 shell 命令失败
+  $ROOT/.slow_pm            内容为秒数 → pm list packages 变慢（测试迟到结果）
+  $ROOT/.serialno_empty     存在 → ro.serialno 读出来是空的
+  $ROOT/.swap_after_install 存在 → 安装成功后，无线地址背后换成另一台手机（PHYS-B）
 每次调用都追加到 $FAKE_ADB_LOG：  时间戳<TAB>参数
 """
 import os, re, sys, time, shutil
@@ -60,6 +65,8 @@ def device_states():
     return d
 
 def physical(serial):
+    if has(".serialno_empty"):
+        return ""
     if serial == USB:
         return PHYS_A
     if serial in wireless_list():
@@ -159,6 +166,8 @@ def main():
     if cmd == "tcpip":
         print("restarting in TCP mode port: %s" % (args[1] if len(args) > 1 else "5555")); return 0
     if cmd == "shell":
+        if has(".shell_fail"):
+            die("error: closed")
         return do_shell(serial, " ".join(args[1:]))
     if cmd == "exec-out":
         return do_exec_out(" ".join(args[1:]))
@@ -185,6 +194,21 @@ PROPS = {"ro.product.brand": "google", "ro.product.model": "Pixel Test",
          "ro.product.cpu.abi": "arm64-v8a"}
 
 def do_shell(serial, cmdline):
+    if cmdline.startswith("echo __SN__;"):
+        print("__SN__"); print(physical(serial)); print(""); print("__END__")
+        return 0
+    if cmdline.startswith("echo __BEGIN__;"):
+        m = re.search(r"pm path (\S+);", cmdline)
+        pkg = m.group(1) if m else ""
+        print("__BEGIN__")
+        for p in installed().get(pkg, []):
+            print("package:%s" % p)
+        info = pkg_info(pkg)
+        if info:
+            print("    versionCode=%s minSdk=21" % info.version_code)
+            print("    versionName=%s" % info.version_name)
+        print("__END__")
+        return 0
     if 'echo "' in cmdline and "getprop" in cmdline:
         for k, p in re.findall(r'echo "(\w+)=\$\(getprop ([\w.]+)\)"', cmdline):
             v = physical(serial) if p == "ro.serialno" else PROPS.get(p, "")
@@ -215,6 +239,9 @@ def do_shell(serial, cmdline):
     if cmdline.startswith("ip -f inet addr show wlan0"):
         print("    inet 192.168.1.9/24 brd 192.168.1.255 scope global wlan0"); return 0
     if cmdline.startswith("pm list packages"):
+        d = float(read(".slow_pm", "0") or 0)
+        if d:
+            time.sleep(d)
         with_path = "-f" in cmdline.split()
         for pkg, paths in installed().items():
             if with_path:
@@ -266,6 +293,10 @@ def do_install(serial, rest):
     if has(".verify_lie"):
         print("Success"); return 0
     dest = os.path.join(ROOT, "data/app", "%s-1" % info.package)
+    if has(".fail_after_install"):
+        open(ctl(".shell_fail"), "w").write("1")
+    if has(".swap_after_install"):
+        open(ctl(".wifi_phone"), "w").write("PHYS-B")
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest, exist_ok=True)
     for f in files:

@@ -129,6 +129,7 @@ function statusText(it) {
   if (it.status === "failed") return "✕ " + txt;
   if (it.status === "unverified") return "⚠ " + txt;
   if (it.status === "cancelled" || it.status === "cancel_installed") return "■ " + txt;
+  if (it.status === "pending_verify") return "⏳ " + txt;
   return it.status || "";
 }
 function installedTag(ins) {
@@ -158,8 +159,8 @@ function renderQueue() {
     if (it.duplicate) tags.push(`<span class="tag warn">${escapeHtml(t("tagDup"))}</span>`);
     if (it.error) tags.push(`<span class="tag warn">${escapeHtml(it.error)}</span>`);
     if (it.minSdk) tags.push(`<span class="tag">${escapeHtml(t("tagMinSdk", { n: it.minSdk }))}</span>`);
-    const hint = (it.status === "failed" || it.status === "unverified" || it.status === "cancelled")
-      ? codeHint(it.code) : "";
+    const hint = (it.status === "failed" || it.status === "unverified" || it.status === "cancelled"
+      || it.status === "pending_verify") ? codeHint(it.code, it.arg) : "";
     const installed = it.installed && it.installed.state && it.installed.state !== "none";
     li.innerHTML = `
       <span class="handle">⠿</span>
@@ -403,7 +404,8 @@ async function startInstall(mode, ids) {
   if (r.code === "choose_mode") {
     // 这台设备上已经装成功过一部分：不盲目从头重装
     const c = await modalChoice(t("chooseTitle"),
-      `<p>${escapeHtml(t("chooseBody", { d: r.done, n: r.remaining }))}</p>`, [
+      `<p>${escapeHtml(t("chooseBody", { d: r.done, n: r.remaining }))}</p>` +
+      (r.pending ? `<p class="muted">${escapeHtml(t("choosePending", { n: r.pending }))}</p>` : ""), [
         { key: "remaining", label: t("chooseRemaining", { n: r.remaining }), primary: true, disabled: !r.remaining },
         { key: "all", label: t("chooseAll") },
         { key: null, label: t("cancel") },
@@ -428,7 +430,14 @@ $("#btnPauseAfter").onclick = async () => {
 $("#btnContinue").onclick = () => continueInstall(null);
 async function continueInstall(rebind) {
   const r = await api("/api/install/continue", { rebind });
-  if (r.ok) { toast(t("tContinued"), t("tStartInstallSub", { n: r.remaining }), "ok"); return; }
+  if (r.ok) {
+    toast(t("tContinued"), t("tStartInstallSub", { n: r.remaining }) +
+      (r.pending ? " · " + t("tStillPending", { n: r.pending }) : ""), "ok");
+    return;
+  }
+  if (r.code === "nothing_remaining" && r.pending) {
+    toast(t("tCantStart"), t("tStillPending", { n: r.pending }), "warn"); return;
+  }
   if (r.code === "bound_target_lost" || r.code === "bound_target_mismatch") {
     const cur = currentDevice();
     const job = S.job || {};
@@ -465,7 +474,12 @@ $("#btnMark").onclick = async () => {
 };
 $("#btnQuit").onclick = async () => {
   if (!confirm(t("tQuit"))) return;
-  await api("/api/quit", {});
+  let r = await api("/api/quit", {});
+  if (!r.ok && r.code === "busy_install") {
+    if (!confirm(t("tQuitBusy"))) return;
+    r = await api("/api/quit", { force: true });
+  }
+  if (!r.ok) { toast(t("tCantStart"), errText(r), "err"); return; }
   document.body.innerHTML = `<div class="empty" style="padding-top:120px">${escapeHtml(t("tQuitDone"))}</div>`;
 };
 
@@ -473,7 +487,7 @@ $("#btnQuit").onclick = async () => {
 function renderJobControls() {
   const j = S.job || {};
   const running = !!j.running;
-  const paused = !!j.paused && (j.remaining || 0) > 0;
+  const paused = !!j.paused && ((j.remaining || 0) > 0 || (j.pending || 0) > 0);
   $("#btnInstall").classList.toggle("hidden", running);
   $("#btnPauseAfter").classList.toggle("hidden", !running);
   $("#btnCancelCur").classList.toggle("hidden", !running || !j.current);
@@ -485,7 +499,8 @@ function renderJobControls() {
   $("#btnInstall").classList.toggle("primary", !paused);
   const b = $("#jobBanner");
   if (paused) {
-    b.textContent = t("jp_" + (j.pauseReason || "user"), { d: j.name || j.serial || "", n: j.remaining || 0 });
+    b.textContent = t("jp_" + (j.pauseReason || "user"), { d: j.name || j.serial || "", n: j.remaining || 0 }) +
+      (j.pending ? " " + t("tStillPending", { n: j.pending }) : "");
     b.className = "banner " + (["target_lost", "target_mismatch"].includes(j.pauseReason) ? "err" : "");
   } else if (running && j.pauseAfterCurrent) {
     b.textContent = t("jp_pending", { c: j.currentLabel || "" });
@@ -683,6 +698,8 @@ function renderConsole() {
   else if (sup.tasks.discovery.state === "waiting") sum = t("sumFailWait");
   else sum = t("sumRunning", { at: fmtTime(sup.devicesAt) });
   if (sup.wifiPaused && !sup.bgPaused) sum += " " + t("sumWifiPaused");
+  if ((sup.bgPaused || sup.wifiPaused) && S.devices.some(d => d.wireless && d.origin === "unknown"))
+    sum += " " + t("sumExternalConn");
   $("#cSummary").textContent = sum;
   $("#cSummary").className = "ctl-summary " + (sup.bgPaused ? "warn" : "");
 
@@ -694,6 +711,7 @@ function renderConsole() {
     const procs = (sv.processes || []).map(p => `
       <tr><td>${p.pid}</td><td>${escapeHtml(t("po_" + p.owner))}</td><td class="mono">${escapeHtml(p.args)}</td></tr>`).join("");
     $("#cServer").innerHTML = `
+      <div class="kv"><span>${escapeHtml(t("cAppVer"))}</span><b>${escapeHtml(S.version || "—")} · Python ${escapeHtml((S.runtime || {}).pythonVersion || "?")} <span class="mono">${escapeHtml((S.runtime || {}).python || "")}</span></b></div>
       <div class="kv"><span>${escapeHtml(t("cAdbPath"))}</span><b class="mono">${escapeHtml(sv.path || "—")}</b></div>
       <div class="kv"><span>${escapeHtml(t("cAdbVer"))}</span><b>${escapeHtml(sv.version || "—")}</b></div>
       <div class="kv"><span>${escapeHtml(t("cAdbPort"))}</span><b>${sv.port} · ${escapeHtml(t(sv.listening ? "cListening" : "cNotListening"))}</b></div>
@@ -717,6 +735,7 @@ function renderConsole() {
         <span class="mono">${escapeHtml(d.serial)}</span>
         <span class="ds ds-${d.state}">${escapeHtml(stateText(d))}</span>
         ${d.detailPaused ? `<span class="muted">${escapeHtml(t("dDetailPaused"))}</span>` : ""}
+        ${d.wireless && d.origin === "unknown" ? `<span class="tag warn">${escapeHtml(t("dOriginUnknown"))}</span>` : ""}
         ${d.wireless ? `<button class="ghost small danger" data-dis="${escapeHtml(d.serial)}">${escapeHtml(t("cDisconnectThis"))}</button>` : ""}
       </div>`).join("");
     return `<div class="dgroup">
@@ -774,12 +793,12 @@ function renderConsole() {
       <div class="kv"><span>${escapeHtml(t("cBoundPhys"))}</span><b class="mono">${escapeHtml(j.physical || t("dPhysicalUnknown"))}</b></div>
       <div class="kv"><span>${escapeHtml(t("cState"))}</span><b>${escapeHtml(t(state))}${j.paused ? " — " + escapeHtml(t("pr_" + (j.pauseReason || "user"))) : ""}</b></div>
       <div class="kv"><span>${escapeHtml(t("cCurrentApk"))}</span><b>${escapeHtml(j.currentLabel || "—")}</b></div>
-      <div class="kv"><span>${escapeHtml(t("cProgress"))}</span><b>${j.done || 0}/${j.total || 0} · ${escapeHtml(t("cCounts", { o: j.ok || 0, f: j.failed || 0, u: j.unverified || 0 }))}</b></div>
+      <div class="kv"><span>${escapeHtml(t("cProgress"))}</span><b>${j.done || 0}/${j.total || 0} · ${escapeHtml(t("cCounts", { o: j.ok || 0, f: j.failed || 0, u: j.unverified || 0 }))}${j.pending ? " · " + escapeHtml(t("cPendingN", { n: j.pending })) : ""}</b></div>
       <div class="kv"><span>${escapeHtml(t("cRemaining"))}</span><b>${j.remaining || 0}</b></div>
       <div class="ctl-row">
         ${j.running ? `<button class="ghost small" data-j="pause" ${j.pauseAfterCurrent ? "disabled" : ""}>${escapeHtml(t(j.pauseAfterCurrent ? "pauseAfterSet" : "pauseAfterCurrent"))}</button>
           <button class="ghost small danger" data-j="cancel">${escapeHtml(t("cancelCurrent"))}</button>` : ""}
-        ${!j.running && j.paused && j.remaining ? `<button class="primary small" data-j="continue">${escapeHtml(t("continueN", { n: j.remaining }))}</button>` : ""}
+        ${!j.running && j.paused && (j.remaining || j.pending) ? `<button class="primary small" data-j="continue">${escapeHtml(t("continueN", { n: j.remaining }))}</button>` : ""}
       </div>
       <p class="muted small-note">${escapeHtml(t("cInstallNote"))}</p>`;
     $$("#cInstall [data-j]").forEach(b => b.onclick = () => ({
@@ -836,6 +855,7 @@ function renderWireless() {
         <span class="tag ${d.wireless ? "tag-wifi" : "tag-usb"}">${escapeHtml(d.wireless ? t("wTagWiFi") : t("wTagUSB"))}</span>
         <span class="wdev-name">${escapeHtml(d.name || d.serial)}</span>
         <span class="muted">${escapeHtml(d.serial)} · ${escapeHtml(stateText(d))}</span>
+        ${d.wireless && d.origin === "unknown" ? `<span class="tag warn">${escapeHtml(t("dOriginUnknown"))}</span>` : ""}
         ${d.duplicate && d.wireless ? `<span class="tag warn">${escapeHtml(t("wDup"))}</span>` : ""}
         ${d.wireless ? `<button class="ghost small danger wd-dis" data-s="${escapeHtml(d.serial)}">${escapeHtml(t("cDisconnectThis"))}</button>` : ""}
       </div>`).join("");
@@ -1016,6 +1036,7 @@ async function refreshState() {
   S.settings = st.settings || {};
   S.settings.__adbOk = !!(st.adb && st.adb.available);
   S.job = st.job || null;
+  S.version = st.version; S.runtime = st.runtime;
   renderQueue();
   const sel = $("#profileSel");
   const cur = sel.value;
@@ -1044,6 +1065,7 @@ function connectEvents() {
 function summaryText(e) {
   let s = t("tSummary", { o: e.ok, f: e.failed, s: e.skipped });
   if (e.unverified) s += t("tSummaryUnv", { n: e.unverified });
+  if (e.pending) s += " · " + t("cPendingN", { n: e.pending });
   return s;
 }
 function handleEvent(e) {
@@ -1086,6 +1108,7 @@ function handleEvent(e) {
       if (e.status === "cancelled" || e.status === "cancel_installed")
         toast(t("tCancelled", { name }), codeText(e.code, e.arg), "warn");
       if (e.status === "skipped") toast(t("tSkipped"), name + " — " + codeText(e.code, e.arg), "warn");
+      if (e.status === "pending_verify") toast(t("tPendingVerify", { name }), codeText(e.code, e.arg), "warn");
       break;
     }
     case "install_paused":

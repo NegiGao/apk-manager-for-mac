@@ -2,6 +2,7 @@
 """本地 HTTP 服务：给浏览器界面提供 API（仅监听 127.0.0.1）。"""
 import json
 import os
+import sys
 import queue
 import re
 import threading
@@ -11,6 +12,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .paths import STAGING_DIR, ICON_DIR, BASE_DIR
+from .version import VERSION
 
 # 只服务这几种静态文件，用小表代替 mimetypes 模块
 CTYPES = {
@@ -129,13 +131,22 @@ class Handler(BaseHTTPRequestHandler):
                 safe = os.path.normpath(rel).lstrip("./")
                 return self._file(os.path.join(WEB_DIR, safe))
             if path == "/api/ping":
-                return self._json({"ok": True, "ready": self.engine is not None})
+                E0 = self.engine
+                busy = bool(E0 and ((E0.job or {}).get("running") or
+                                    (E0.apps_scan or {}).get("running")))
+                return self._json({"ok": True, "ready": E0 is not None, "version": VERSION,
+                                   "busy": busy, "pid": os.getpid()})
             E = self._wait_engine()
             if E is None:
                 return self._json({"ok": False, "booting": True,
                                    "error": "正在启动…"}, 200)
             if path == "/api/state":
-                return self._json(E.state())
+                st = E.state()
+                st["version"] = VERSION
+                st["runtime"] = {"python": sys.executable,
+                                 "pythonVersion": "%d.%d.%d" % sys.version_info[:3],
+                                 "pid": os.getpid()}
+                return self._json(st)
             if path == "/api/devices":
                 return self._json(E.devices())          # 缓存，不跑 adb
             if path == "/api/supervisor":
@@ -316,6 +327,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": True, "path": p})
                 return self._json({"ok": False, "error": "路径无效"})
             if path == "/api/quit":
+                r = E.quit_check(bool(self._json_body().get("force")))
+                if not r.get("ok"):
+                    return self._json(r)
                 threading.Thread(target=self._shutdown, daemon=True).start()
                 return self._json({"ok": True})
             return self._send(404, "not found", "text/plain; charset=utf-8")
