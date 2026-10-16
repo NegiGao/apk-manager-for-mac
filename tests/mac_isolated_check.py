@@ -14,7 +14,9 @@ import argparse, hashlib, json, os, plistlib, shutil, signal, socket, subprocess
 import urllib.request
 
 RESULTS = []
-STARTED = []          # 本驱动启动的进程
+STARTED = []          # 本驱动启动的进程（Popen 句柄）
+RECORDED = {}         # pid -> {"args", "parent"}：本驱动启动的进程及其子孙（运行中按父进程链确认并记录）
+_REC_LOCK = __import__("threading").Lock()
 LOG = []
 LOG_PATH = [None]
 
@@ -26,6 +28,39 @@ def say(msg):
     if LOG_PATH[0]:
         with open(LOG_PATH[0], "a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+
+def record_tree():
+    """把「本驱动启动的进程」的子孙（按 ppid 链确认）记进 RECORDED。只记录，不结束任何进程。"""
+    rows = ps_rows()
+    alive = {pid: (ppid, args) for pid, ppid, args in rows}
+    with _REC_LOCK:
+        roots = {p.pid for p in STARTED}
+        for r in roots:
+            if r in alive:
+                RECORDED.setdefault(r, {"parent": os.getpid()})["args"] = alive[r][1]
+        changed = True
+        while changed:
+            changed = False
+            for pid, (ppid, args) in alive.items():
+                if ppid in RECORDED and ppid in alive and pid not in RECORDED:
+                    RECORDED[pid] = {"args": args, "parent": ppid}
+                    changed = True
+                elif pid in RECORDED and ppid in RECORDED:
+                    RECORDED[pid]["args"] = args          # exec 之后命令行会变：更新为最新
+
+
+def start_recorder():
+    import threading
+
+    def loop():
+        while True:
+            try:
+                record_tree()
+            except Exception:
+                pass
+            time.sleep(0.5)
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def my_lineage():
@@ -438,34 +473,52 @@ def t6_upgrade(c, label, old_dir):
 
 
 def cleanup(c):
-    say("== 清理：只结束本次测试启动的进程")
-    for p in STARTED:
-        if p.poll() is None:
-            p.terminate()
-    time.sleep(2)
-    for p in STARTED:
-        if p.poll() is None:
-            p.kill()
+    say("== 清理：只结束本驱动启动并记录的进程，及运行中确认过的子进程（不按路径字符串批量结束）")
+    record_tree()
     for f in ("homes",):
         base = os.path.join(c.work, f)
         for dp, _, fs in os.walk(base):
             for n in fs:
                 if n.startswith(".hold_"):
                     os.remove(os.path.join(dp, n))
-    time.sleep(1)
-    kit = os.path.dirname(c.work)                # 测试工具包目录：程序、假 ADB、旧版本源码都在里面
     keep = my_lineage()
-    left = [(pid, args) for pid, _, args in ps_rows() if kit in args and pid not in keep] + \
-        [(pid, args) for pid, args in c.servers() if pid not in keep]
-    for pid, args in left:                       # 命令行里带本测试目录路径的，一定是本次测试启动的
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except Exception:
-            pass
+    ended, zombies = [], []
+    for p in STARTED:                             # 1) 本驱动的 Popen 子进程：句柄本身就保证是它
+        if p.poll() is None:
+            p.terminate()
+            ended.append((p.pid, "started: %s" % " ".join(p.args if isinstance(p.args, list) else [str(p.args)])[:120]))
+    t = time.time()
+    while time.time() - t < 5 and any(p.poll() is None for p in STARTED):
+        time.sleep(0.2)
+    for p in STARTED:
+        if p.poll() is None:
+            p.kill()
+    # 2) 运行中按父进程链确认过的子孙：仍存活且命令行与记录一致（防 PID 被系统复用）才结束
+    now = {pid: args for pid, _, args in ps_rows()}
+    with _REC_LOCK:
+        recs = dict(RECORDED)
+    for pid, info in recs.items():
+        if pid in keep or pid in {p.pid for p in STARTED}:
+            continue
+        if pid in now and "<defunct>" in now[pid]:
+            zombies.append((pid, "child of %s: %s" % (info.get("parent"), now[pid][:80])))
+            continue                              # 已退出、等父进程回收的僵尸：发信号无意义，只记录
+        if pid in now and now[pid] == info.get("args"):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                ended.append((pid, "child of %s: %s" % (info.get("parent"), now[pid][:120])))
+            except Exception:
+                pass
     time.sleep(1)
+    say("   本次记录的进程 %d 个；清理时仍在运行并已结束 %d 个：%s" % (len(recs), len(ended), ended or "无"))
+    if zombies:
+        say("   已退出、尚未被父进程回收的僵尸进程（未发信号）：%s" % zombies)
+    # 3) 只读核对：命令行里带本测试目录、或工作目录是本次解压的 .app 的进程——只报告，不结束
+    kit = os.path.dirname(c.work)
     left2 = [(pid, args[:160]) for pid, _, args in ps_rows() if kit in args and pid not in keep] + \
         [(pid, args[:160]) for pid, args in c.servers() if pid not in keep]
-    check(not left2, "测试结束后，没有残留的测试进程", "清理前残留 %d 个，清理后 %d 个" % (len(left), len(left2)))
+    check(not left2, "测试结束后，没有残留的测试进程（只读核对，残留不会被按路径结束）", "残留 %d 个%s" % (
+        len(left2), "：%s" % left2 if left2 else ""))
     others = [(pid, args[:120]) for pid, _, args in ps_rows()
               if ("app.py" in args and "--app-mode" in args or "/adb " in args or args.endswith("/adb"))
               and kit not in args and pid not in {p for p, _ in c.servers()}]
@@ -489,6 +542,7 @@ def main():
     os.makedirs(a.work, exist_ok=True)
     LOG_PATH[0] = os.path.join(a.work, "driver.log")
     c = Ctx(a)
+    start_recorder()
     say("测试目录：%s" % a.work)
     say("驱动 Python：%s %s" % (sys.executable, sys.version.split()[0]))
     stopped = None
