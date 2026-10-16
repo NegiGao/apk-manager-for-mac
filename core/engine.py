@@ -680,7 +680,16 @@ class Engine(object):
         if sn["state"] == "ok":
             return "ok", sn["value"], "serialno"
         if not self.adb.is_wireless_serial(serial):
-            return "ok", "usb:" + serial, "usb"      # USB 序列号本身就能标识这台机器
+            # 读不到物理序号的 USB 设备：只看 USB 序列号不够（廉价机常共用 0123456789ABCDEF 之类），
+            # 再绑定这条连接的 transport_id——拔线、换机都会让它变化。拿不到就当作无法确认。
+            with self.adb.source("install"):
+                try:
+                    tid = self.adb.transport_id(serial)
+                except Exception:
+                    return "error", None, None
+            if tid:
+                return "ok", "usb:%s#t%s" % (serial, tid), "usb"
+            return "ok", None, "unknown"
         return "ok", None, "unknown"                  # Wi-Fi 地址不能代表身份
 
     def _target_check(self, job):

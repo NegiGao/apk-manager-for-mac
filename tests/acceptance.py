@@ -535,7 +535,7 @@ def s12():
         I.post("/api/import", {"path": APKS["termux"]})
         I.post("/api/install", {"serial": USB, "mode": "all"})
         I.wait(lambda: any(e["type"] == "install_done" for e in I.events), timeout=30, what="USB 完成")
-        check(items(I)["Termux"]["code"] == "installed_verified", "USB 读不到序号时用 USB 序列号识别 → 已核验")
+        check(items(I)["Termux"]["code"] == "installed_verified", "USB 读不到序号时用 USB 序列号 + 连接 transport_id 识别（连接未断）→ 已核验")
         I.events.clear()
         I.post("/api/install", {"serial": WIFI, "mode": "all"})
         I.wait(lambda: any(e["type"] in ("install_done", "install_paused") for e in I.events), timeout=30, what="Wi-Fi 完成")
@@ -558,6 +558,39 @@ def s12():
               "装完后同一 Wi-Fi 地址背后换了手机 → 不拿另一台的版本判成功（%s）" % it["Termux"]["code"])
         check(job(I)["pauseReason"] == "target_mismatch" and it["NewPipe"]["status"] == "pending",
               "队列暂停，没有继续往新机器上装")
+    finally:
+        I.close()
+
+    # USB 读不到物理序号、两台机器共用同一个 USB 序列号：靠 transport_id 识别拔插换机
+    I = Inst("s12d", FAST)
+    try:
+        I.ctl(".serialno_empty", "1")
+        I.wait(lambda: I.sup()["devicesAt"] and len(I.sup()["devices"]) == 1, what="设备")
+        time.sleep(1.5)
+        import_all(I, ("termux", "newpipe"))
+        I.ctl(".replug_after_install", "1")
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait(lambda: job(I).get("paused"), timeout=30, what="暂停")
+        it = items(I)
+        check(it["Termux"]["status"] == "unverified" and it["Termux"]["code"] == "verify_identity_changed",
+              "USB 无序号 + 装完后拔插换上同序列号的另一台 → 不判成功（%s）" % it["Termux"]["code"])
+        check(job(I)["pauseReason"] == "target_mismatch" and it["NewPipe"]["status"] == "pending",
+              "队列暂停，没有继续往换上的机器上装")
+    finally:
+        I.close()
+
+    I = Inst("s12e", FAST)
+    try:
+        I.ctl(".serialno_empty", "1")
+        I.ctl(".transport_id", "")
+        I.wait(lambda: I.sup()["devicesAt"] and len(I.sup()["devices"]) == 1, what="设备")
+        time.sleep(1.5)
+        I.post("/api/import", {"path": APKS["termux"]})
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait(lambda: any(e["type"] in ("install_done", "install_paused") for e in I.events), timeout=30, what="结束")
+        it = items(I)["Termux"]
+        check(it["status"] == "unverified" and it["code"] == "verify_identity_unknown",
+              "USB 无序号且 adb 不提供 transport_id → 身份无法确认，不判成功（%s）" % it["code"])
     finally:
         I.close()
 

@@ -400,6 +400,14 @@ class Adb(object):
         return devs
 
     # -- 无线连接 --------------------------------------------------------
+    def transport_id(self, serial):
+        """adb 给这条连接分配的 transport_id；每次重新连接（拔插、换机）都会变。
+        返回字符串；adb 不提供时返回 ""；`adb devices` 本身失败时抛 AdbError。"""
+        for d in self.devices():
+            if d["serial"] == serial:
+                return d.get("transport") or ""
+        return ""
+
     @staticmethod
     def is_wireless_serial(serial):
         """无线设备的序列号形如 192.168.1.9:5555 或 adb-XXXX._adb-tls-connect._tcp"""

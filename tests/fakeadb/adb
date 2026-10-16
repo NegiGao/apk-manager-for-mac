@@ -13,6 +13,8 @@
   $ROOT/.slow_pm            内容为秒数 → pm list packages 变慢（测试迟到结果）
   $ROOT/.serialno_empty     存在 → ro.serialno 读出来是空的
   $ROOT/.swap_after_install 存在 → 安装成功后，无线地址背后换成另一台手机（PHYS-B）
+  $ROOT/.transport_id       USB 设备的 transport_id（默认 1）；为空字符串 → 不提供 transport_id
+  $ROOT/.replug_after_install 存在 → 安装成功后 USB 被拔插（transport_id 加一，模拟换上同序列号的另一台）
 每次调用都追加到 $FAKE_ADB_LOG：  时间戳<TAB>参数
 """
 import os, re, sys, time, shutil
@@ -121,7 +123,9 @@ def main():
     if cmd == "devices":
         print("List of devices attached")
         for s, st in device_states().items():
-            extra_s = " product:fake model:Pixel_Test device:fake transport_id:1" if st == "device" else ""
+            tid = "9" if ":" in s else (read(".transport_id") if has(".transport_id") else "1")
+            extra_s = (" product:fake model:Pixel_Test device:fake" + (" transport_id:" + tid if tid else "")) \
+                if st == "device" else ""
             print("%s\t%s%s" % (s, st, extra_s))
         return 0
     if cmd == "pair":
@@ -297,6 +301,8 @@ def do_install(serial, rest):
         open(ctl(".shell_fail"), "w").write("1")
     if has(".swap_after_install"):
         open(ctl(".wifi_phone"), "w").write("PHYS-B")
+    if has(".replug_after_install"):
+        open(ctl(".transport_id"), "w").write(str(int(read(".transport_id", "1") or "1") + 1))
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest, exist_ok=True)
     for f in files:
