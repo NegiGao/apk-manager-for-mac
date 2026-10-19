@@ -558,7 +558,9 @@ function refreshDeviceSelect() {
     o.disabled = d.state !== "device" || (uo && d.serial !== uo.serial);
     sel.appendChild(o);
   });
-  const usable = S.devices.filter(d => d.state === "device" && (!uo || d.serial === uo.serial));
+  // USB 优先（后台也是这样选的；这里只是后台还没选时的兜底）
+  const usable = S.devices.filter(d => d.state === "device" && (!uo || d.serial === uo.serial))
+    .sort((a, b) => (a.wireless ? 1 : 0) - (b.wireless ? 1 : 0));
   if (sup.selected && S.devices.some(d => d.serial === sup.selected && d.state === "device")) {
     sel.value = sup.selected;
   } else if (!sup.selected && usable.length) {
@@ -1072,6 +1074,9 @@ function handleEvent(e) {
   switch (e.type) {
     case "supervisor":
       applySup(e.state);
+      break;
+    case "device_autoselect":
+      toast(t("tAutoSelUsb"), t("tAutoSelUsbMsg", { d: e.name || e.serial }), "ok");
       break;
     case "job":
       S.job = e.job;

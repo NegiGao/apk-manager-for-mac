@@ -470,6 +470,9 @@ def s11():
     try:
         I.ctl(".extra_devices", "SECOND01\tdevice")
         ready(I)
+        # 后台启动时会自己选中 USB 设备；先切到另一台，确保下面「选回 USB」是一次真正的切换，会排队标记查询
+        I.post("/api/supervisor/select", {"serial": "SECOND01"})
+        time.sleep(2)
         I.post("/api/import", {"path": APKS["termux"]})
         I.preinstall("termux", "com.termux")
         I.ctl(".slow_pm", "3")
@@ -1123,9 +1126,92 @@ def s22():
     for p in (po, pn):
         p.kill()
 
+def wait_for(pred, timeout, step=0.2):
+    t = time.time()
+    while time.time() - t < timeout:
+        try:
+            if pred():
+                return True
+        except Exception:
+            pass
+        time.sleep(step)
+    return False
+
+
+def s23():
+    print("\n[23] 插上 USB 线的设备默认成为当前设备（只改界面选中的设备，不改安装任务绑定）")
+    sel = lambda I: I.sup().get("selected")
+    I = Inst("s23a", FAST)
+    try:
+        I.ctl(".unplugged", "1")                         # 主 USB 先不插
+        I.ctl(".wireless", WIFI)
+        I.ctl(".extra_devices", "CABLE01\tdevice")       # 列表里 Wi-Fi 在前，USB 在后
+        I.wait(lambda: I.sup()["devicesAt"] and len(I.sup()["devices"]) == 2, what="设备")
+        if not wait_for(lambda: sel(I), 6):
+            # 后台没有选择时，界面会自己选列表里第一台可用设备（旧版就是这样）——这里照做，模拟打开的窗口
+            first = next(d["serial"] for d in I.sup()["devices"] if d["state"] == "device")
+            I.post("/api/supervisor/select", {"serial": first})
+        check(sel(I) == "CABLE01", "启动时 USB 优先于 Wi-Fi（选中 %s）" % sel(I))
+
+        I.post("/api/supervisor/select", {"serial": WIFI})
+        I.events.clear()
+        I.ctl(".unplugged")                              # 插上另一台的 USB 线
+        wait_for(lambda: sel(I) == USB, 15)
+        ev = [e for e in I.events if e["type"] == "device_autoselect"]
+        check(sel(I) == USB and ev and ev[-1]["previous"] == WIFI,
+              "选着 Wi-Fi 时插上 USB 线 → 自动切到它，并提示（事件 %d 条）" % len(ev))
+
+        I.ctl(".unplugged", "1")                         # 拔掉
+        time.sleep(3)
+        check(sel(I) == USB, "拔掉后不自动换成其他已连设备（仍是 %s，界面显示已断开）" % sel(I))
+
+        I.ctl(".extra_devices", "CABLE01\tdevice\nPHONEB\tdevice")   # 换插另一台手机
+        wait_for(lambda: sel(I) == "PHONEB", 15)
+        check(sel(I) == "PHONEB", "拔掉 A、插上 B → 自动选中 B（选中 %s）" % sel(I))
+
+        I.ctl(".unplugged")                              # 又插上一根线，但当前已选着在线的 USB 设备
+        time.sleep(3)
+        check(sel(I) == "PHONEB", "已选着在线的 USB 设备时，再插一台不抢选择（仍是 %s）" % sel(I))
+
+        I.post("/api/supervisor/usb-only", {"serial": "PHONEB"})
+        I.ctl(".unplugged", "1"); time.sleep(2.5); I.ctl(".unplugged")
+        time.sleep(3)
+        check(sel(I) == "PHONEB", "「仅 USB」锁定时不切换（仍是 %s）" % sel(I))
+    finally:
+        I.close()
+
+    # 暂停中的队列绑定在 Wi-Fi 设备上：插上 USB 后选择会切过去，但继续安装仍只装到原设备
+    I = Inst("s23b", FAST)
+    try:
+        I.ctl(".unplugged", "1")
+        I.ctl(".wireless", WIFI)
+        I.wait(lambda: I.sup()["devicesAt"] and len(I.sup()["devices"]) == 1, what="设备")
+        time.sleep(1.5)
+        import_all(I, ("termux", "newpipe"))
+        I.hold("inst", r" install ")
+        I.post("/api/install", {"serial": WIFI, "mode": "all"})
+        I.wait_held("inst")
+        I.post("/api/install/cancel-current", {})
+        I.release("inst")
+        I.wait(lambda: job(I).get("paused"), timeout=20, what="队列暂停")
+        I.ctl(".unplugged")
+        if not wait_for(lambda: sel(I) == USB, 15):
+            I.post("/api/supervisor/select", {"serial": USB})   # 旧版不会自动切：手动选上，照样检查绑定
+        t = time.time()
+        I.events.clear()
+        r = I.post("/api/install/continue", {})
+        I.wait(lambda: any(e["type"] in ("install_done", "install_paused") for e in I.events), timeout=30, what="继续结束")
+        on_usb = after(I, t, r"-s %s install" % USB)
+        on_wifi = after(I, t, r"-s %s install" % WIFI.replace(".", r"\."))
+        check(r.get("ok") and not on_usb and on_wifi,
+              "选择切到 USB 后点「继续」：只装到队列绑定的原设备（USB %d 次，Wi-Fi %d 次）" % (len(on_usb), len(on_wifi)))
+    finally:
+        I.close()
+
 ALL = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6, "7": s7, "8": s8, "9": s9,
        "10": s10, "11": s11, "12": s12, "13": s13, "14": s14, "15": s15, "16": s16,
-       "17": s17, "18": s18, "19": s19, "20": s20, "20b": s20b_continue, "21": s21, "22": s22}
+       "17": s17, "18": s18, "19": s19, "20": s20, "20b": s20b_continue, "21": s21, "22": s22,
+       "23": s23}
 if __name__ == "__main__":
     which = sys.argv[1:] or list(ALL)
     for k in which:

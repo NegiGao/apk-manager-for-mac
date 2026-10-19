@@ -457,10 +457,37 @@ class Supervisor(object):
         for d in devs:
             if d["state"] == "device" and d["serial"] in self.reconnect:
                 self.reconnect.pop(d["serial"], None)
-        if self.selected and self.selected not in live:
-            pass   # 不自动换到别的设备
         self.devices = devs
         self.devices_at = _now()
+        self._auto_select(prev, devs)
+
+    def _auto_select(self, prev, devs):
+        """插上 USB 线的设备默认成为目标设备。只改「界面选中的设备」，不改任何安装任务的绑定：
+        暂停中的队列仍绑定原设备，不会因此续装到新插上的设备。
+        - 新插上（或刚点了「允许」）的 USB 设备：当前没选、选的是 Wi-Fi、或选中的设备已断开 → 切到它；
+          当前已经选着一台在线的 USB 设备时不抢（多根线同时接时以用户的选择为准）。
+        - 还没选过：USB 优先，其次才是 Wi-Fi。
+        - 选中的设备断开时，仍然不自动换到别的已连设备。仅 USB 模式下一律不动。"""
+        if self.usb_only:
+            return
+        ready = [d for d in devs if d["state"] == "device"]
+        usb_ready = [d for d in ready if not d["wireless"]]
+        cur = next((d for d in ready if d["serial"] == self.selected), None)
+        newly = [d for d in usb_ready if prev.get(d["serial"]) != "device"]
+        pick, why = None, None
+        if newly and (cur is None or cur["wireless"]):
+            pick, why = newly[0], "usb_plugged"
+        elif self.selected is None and ready:
+            pick, why = (usb_ready or ready)[0], "initial"
+        if not pick or pick["serial"] == self.selected:
+            return
+        old = self.selected
+        self.selected = pick["serial"]
+        if self.E.settings.get("autoMark", True):
+            self.pending_mark = pick["serial"]
+        if why == "usb_plugged" and old:
+            self.E.bus.emit("device_autoselect", serial=pick["serial"], name=pick.get("name") or pick["serial"],
+                            previous=old)
 
     def _task_status(self, manual=False):
         with self.lock:
