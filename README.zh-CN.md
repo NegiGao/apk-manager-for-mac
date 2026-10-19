@@ -30,7 +30,8 @@
 - **当前完成后暂停**：正在装的这一个装完就停，不会中途打断；**继续安装**只装剩下的。往一台已经装过一部分的
   设备上再装时，会先问「只装剩下的 / 全部重装」，不会盲目从头来。
 - **插上数据线的手机自动成为当前设备。** USB 连接的手机就绪时，如果当前没选设备、选的是 Wi-Fi 设备、
-  或选中的设备已断开，就切到这台（启动时也是 USB 优先）。已经选着另一台在线的 USB 手机时不抢；「仅 USB」模式下不切换。
+  或选中的设备已断开，就切到这台（启动时也是 USB 优先）。已经选着另一台在线的 USB 手机时不抢。「仅 USB」模式下，如果锁定的那台没连着（包括刚启动时），锁定会自动跟到
+  用线连着的那台手机，不用再去控制台手动选。
 - 每次安装任务**绑定一台设备**（连接标识 + 核验过的物理序号）。拔线 → 队列暂停；换插另一台手机也不会自己继续；
   不会改走同一台手机的 Wi-Fi 入口，更不会装到别的设备上。
 - 成功要**在设备上核验**：日志出现 `Success` 之后，先确认还是同一台设备，再用 `pm path` + `dumpsys` 读回包信息；
@@ -169,7 +170,7 @@ python3 tests/acceptance.py      # 全部场景（约 10 分钟）；有失败�
 python3 tests/acceptance.py 10 13  # 只跑部分场景
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # 用 3.9 运行程序
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # 保留 adb 命令记录
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.4.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.5.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # 确认诊断脚本对 adb 只执行 `adb version`
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # 用同一套测试跑旧代码
 ```

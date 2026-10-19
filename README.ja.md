@@ -32,7 +32,8 @@ Node も Xcode も不要です。外部に必要なのは `adb` だけで、そ�
   先に確認し、いきなり最初からやり直しません。
 - **ケーブルを挿したスマホが自動で対象端末になります。** USB 接続の端末が使える状態になったとき、何も選んで
   いない・Wi-Fi の端末を選んでいる・選んでいた端末が切断済み、のいずれかならその端末に切り替えます（起動時も USB
-  優先）。オンラインの別の USB 端末を選んでいるときは奪わず、「USB のみ」モードでは切り替えません。
+  優先）。オンラインの別の USB 端末を選んでいるときは奪いません。「USB のみ」モードで、固定した端末がつながって
+  いないとき（起動時を含む）は、ケーブルでつながった端末に固定先が自動で移ります。コンソールで選び直す必要はありません。
 - 各インストール処理は**1 台の端末に固定**されます（接続先＋確認済みの物理シリアル）。ケーブルが抜けたら
   キューは一時停止し、別の端末を挿しても勝手に再開しません。同じ端末の Wi-Fi 側や別の端末に切り替えることも
   ありません。
@@ -192,7 +193,7 @@ python3 tests/acceptance.py      # 全シナリオ（約 10 分）。失敗が�
 python3 tests/acceptance.py 10 13  # 一部だけ
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # アプリを 3.9 で動かす
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # adb コマンド記録を残す
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.4.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.5.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # 診断スクリプトが実行する adb は `adb version` だけであることを確認
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # 同じテストを旧コードで実行
 ```

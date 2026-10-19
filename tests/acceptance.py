@@ -1208,10 +1208,63 @@ def s23():
     finally:
         I.close()
 
+def s24():
+    print("\n[24] 「仅 USB」跟着线走：锁定的那台没插着时，自动改用用线连着的手机（启动时也一样）")
+    sup = lambda I: I.sup()
+    uo = lambda I: (sup(I).get("usbOnly") or {}).get("serial")
+    I = Inst("s24a", FAST, {"usbOnly": {"serial": "OLDPHONE", "physical": "PHYS-OLD", "name": "Old phone"}})
+    try:
+        I.ctl(".wireless", WIFI)                         # 启动时：上次锁定的旧手机没插着，现在插着 USB 线的是另一台
+        I.wait(lambda: sup(I)["devicesAt"] and len(sup(I)["devices"]) == 2, what="设备")
+        wait_for(lambda: uo(I) == USB, 10)
+        check(uo(I) == USB and sup(I).get("selected") == USB,
+              "启动时插着线：「仅 USB」自动锁到这台并选中（锁定 %s，选中 %s）" % (uo(I), sup(I).get("selected")))
+
+        I.ctl(".extra_devices", "PHONEB\tdevice")        # 锁定的那台还在，又插了一台
+        time.sleep(3)
+        check(uo(I) == USB, "锁定的那台还连着时，再插一台不改锁定（仍是 %s）" % uo(I))
+
+        I.events.clear()
+        I.ctl(".unplugged", "1")                         # 拔掉锁定的那台，另一台还插着
+        wait_for(lambda: uo(I) == "PHONEB", 15)
+        ev = [e for e in I.events if e["type"] == "usb_only_follow"]
+        check(uo(I) == "PHONEB" and sup(I).get("selected") == "PHONEB" and ev,
+              "锁定的那台拔掉 → 跟到还插着线的另一台，并提示（锁定 %s，事件 %d 条）" % (uo(I), len(ev)))
+
+        I.ctl(".extra_devices")                          # 只剩 Wi-Fi
+        time.sleep(3)
+        check(uo(I) == "PHONEB", "没有任何 USB 设备时不会锁到 Wi-Fi 设备（仍是 %s）" % uo(I))
+    finally:
+        I.close()
+
+    # 暂停中的队列绑定在原来那台：锁定跟到新手机后，「继续」不会装到新手机上
+    I = Inst("s24b", FAST)
+    try:
+        ready(I)
+        I.post("/api/supervisor/usb-only", {"serial": USB})
+        import_all(I, ("termux", "newpipe"))
+        I.hold("inst", r" install ")
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait_held("inst")
+        I.post("/api/install/cancel-current", {})
+        I.release("inst")
+        I.wait(lambda: job(I).get("paused"), timeout=20, what="队列暂停")
+        I.ctl(".unplugged", "1")
+        I.ctl(".extra_devices", "PHONEB\tdevice")
+        wait_for(lambda: uo(I) == "PHONEB", 15)
+        t = time.time()
+        r = I.post("/api/install/continue", {})
+        time.sleep(3)
+        on_b = after(I, t, r"-s PHONEB install")
+        check(uo(I) == "PHONEB" and not r.get("ok") and not on_b,
+              "锁定跟到新手机后点「继续」：不装到新手机（%s，新手机安装 %d 次）" % (r.get("code"), len(on_b)))
+    finally:
+        I.close()
+
 ALL = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6, "7": s7, "8": s8, "9": s9,
        "10": s10, "11": s11, "12": s12, "13": s13, "14": s14, "15": s15, "16": s16,
        "17": s17, "18": s18, "19": s19, "20": s20, "20b": s20b_continue, "21": s21, "22": s22,
-       "23": s23}
+       "23": s23, "24": s24}
 if __name__ == "__main__":
     which = sys.argv[1:] or list(ALL)
     for k in which:

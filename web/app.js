@@ -1078,6 +1078,9 @@ function handleEvent(e) {
     case "device_autoselect":
       toast(t("tAutoSelUsb"), t("tAutoSelUsbMsg", { d: e.name || e.serial }), "ok");
       break;
+    case "usb_only_follow":
+      toast(t("tUsbOnlyFollow"), t("tUsbOnlyFollowMsg", { d: e.name || e.serial, o: e.previousName || e.previous || "—" }), "ok");
+      break;
     case "job":
       S.job = e.job;
       renderJobControls();

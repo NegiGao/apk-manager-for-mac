@@ -467,13 +467,33 @@ class Supervisor(object):
         - 新插上（或刚点了「允许」）的 USB 设备：当前没选、选的是 Wi-Fi、或选中的设备已断开 → 切到它；
           当前已经选着一台在线的 USB 设备时不抢（多根线同时接时以用户的选择为准）。
         - 还没选过：USB 优先，其次才是 Wi-Fi。
-        - 选中的设备断开时，仍然不自动换到别的已连设备。仅 USB 模式下一律不动。"""
-        if self.usb_only:
-            return
+        - 选中的设备断开时，仍然不自动换到别的已连设备。
+        - 仅 USB 模式：锁定的那台在线就一直用它；锁定的那台没插着、而有别的手机用线连着时，
+          锁定跟着线走到那台（启动时插着线也一样），不用再去控制台手动选。安装进行中不动，等它结束或暂停后再跟。"""
         ready = [d for d in devs if d["state"] == "device"]
         usb_ready = [d for d in ready if not d["wireless"]]
-        cur = next((d for d in ready if d["serial"] == self.selected), None)
         newly = [d for d in usb_ready if prev.get(d["serial"]) != "device"]
+        if self.usb_only:
+            locked = self.usb_only.get("serial")
+            if any(d["serial"] == locked for d in ready):
+                if self.selected != locked:
+                    self.selected = locked
+                return
+            if not usb_ready or (self.E.job or {}).get("running"):
+                return
+            pick = (newly or usb_ready)[0]
+            old = dict(self.usb_only)
+            self.usb_only = {"serial": pick["serial"],
+                             "physical": self.physical_of(pick["serial"]) or pick["serial"],
+                             "name": pick.get("name") or pick["serial"]}
+            self.selected = pick["serial"]
+            if self.E.settings.get("autoMark", True):
+                self.pending_mark = pick["serial"]
+            self._persist()
+            self.E.bus.emit("usb_only_follow", serial=pick["serial"], name=self.usb_only["name"],
+                            previous=old.get("serial"), previousName=old.get("name"))
+            return
+        cur = next((d for d in ready if d["serial"] == self.selected), None)
         pick, why = None, None
         if newly and (cur is None or cur["wireless"]):
             pick, why = newly[0], "usb_plugged"
@@ -517,6 +537,11 @@ class Supervisor(object):
                     self.props[s] = p
                     if is_wireless(s) and p.get("serialno"):
                         self.wifi_meta[s] = p["serialno"]
+                    uo = self.usb_only
+                    if uo and uo.get("serial") == s and p.get("serialno") and uo.get("physical") != p["serialno"]:
+                        uo["physical"] = p["serialno"]          # 自动跟过来时还没读到序号，补上
+                        if p.get("model"):
+                            uo["name"] = " ".join(x for x in [(p.get("brand") or "").title(), p["model"]] if x)
                 if results:
                     self._apply_devices([dict(d) for d in self.devices])
                     self._persist()

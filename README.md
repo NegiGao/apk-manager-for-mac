@@ -34,7 +34,8 @@ no Node, no Xcode. The only external dependency is `adb`, which the app can down
 - **Plugging in a cable selects that phone.** When a phone connected by USB becomes ready, it
   becomes the selected device if nothing was selected, a Wi-Fi device was selected, or the selected
   device had disconnected (USB is also preferred at startup). It doesn't take over from another
-  online USB phone you picked, and nothing changes in USB-only mode.
+  online USB phone you picked. In USB-only mode, if the locked phone isn't connected (also at startup),
+  the lock follows to the phone that is connected by cable — no need to pick it in the console again.
 - Each job is **bound to one device** (connection + verified hardware serial). Unplug it and the
   queue pauses; plug in a different phone and nothing resumes on its own. It never falls back to the
   same phone's Wi-Fi entry or to another device.
@@ -208,7 +209,7 @@ python3 tests/acceptance.py      # all scenarios (≈10 min); exits non-zero if 
 python3 tests/acceptance.py 10 13  # just some of them
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # run the app under 3.9
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # keep adb command logs
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.4.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.5.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # the diagnostics script only ever runs `adb version`
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # same tests against old code
 ```
