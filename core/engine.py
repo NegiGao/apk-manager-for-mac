@@ -516,27 +516,38 @@ class Engine(object):
         self.sup.check_once()
         return {"ok": ok, "message": msg}
 
-    def wireless_switch(self, serial, port=5555):
-        """把当前 USB 设备转成无线连接（只在用户点击时执行，后台从不自动做）。"""
+    def wireless_switch(self, serial, port=5555, exit_usb_only=False):
+        """把用线连着的设备转成无线并连上（只在用户点击时执行，后台从不自动做）。
+        「仅 USB」锁着这台时默认拒绝；用户在界面上确认后（exit_usb_only）先关掉「仅 USB」再切。
+        成功后记住这个无线地址，并把当前设备切到这条无线连接，拔线后可以直接接着用。"""
         if not serial:
             return {"ok": False, "code": "need_usb"}
         if self.adb.is_wireless_serial(serial):
             return {"ok": False, "code": "already_wireless"}
         uo = self.sup.usb_only
         if uo and self._same_device(uo.get("serial"), serial):
-            return {"ok": False, "code": "usb_only_blocks_tcpip"}
+            if not exit_usb_only:
+                return {"ok": False, "code": "usb_only_blocks_tcpip", "arg": uo.get("name") or serial}
+            r = self.sup.set_usb_only(None)           # 安装进行中会被拒绝
+            if not r.get("ok"):
+                return r
         busy = self.busy_reason(serial)
         if busy:
             return {"ok": False, "code": busy}
+        phys = self.sup.physical_of(serial)
+        # adb tcpip 会让手机的 adbd 重启：USB 连接可能短暂掉线又出现。30 秒内不把它当成「新插上」而抢回选择
+        with self.sup.lock:
+            self.sup.autosel_hold[serial] = time.time() + 30
         with self.adb.source("ui"):
             ok, target, msg = self.adb.enable_tcpip(serial, port)
         if ok and target:
             self.remember_wireless(target)
-            phys = self.sup.physical_of(serial)
             if phys:
                 self.sup.wifi_meta[target] = phys
         self.sup.check_once()
-        return {"ok": ok, "target": target, "message": msg,
+        if ok and target:
+            self.sup.select(target)
+        return {"ok": ok, "target": target, "message": msg, "usbOnlyOff": bool(exit_usb_only and uo),
                 "error": None if ok else msg}
 
     def remember_wireless(self, target):

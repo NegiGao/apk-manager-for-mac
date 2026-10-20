@@ -70,7 +70,9 @@ no Node, no Xcode. The only external dependency is `adb`, which the app can down
 **Wireless (Wi-Fi debugging)**
 - Pair with the 6-digit code from Android's Wireless debugging screen, or connect straight to a
   known `IP:port`.
-- One button turns a cabled phone into a wireless one (`adb tcpip` + auto-detected IP).
+- One button turns a cabled phone into a wireless one (`adb tcpip` + auto-detected IP): no need to
+  select it first; it connects (with a few retries), selects the wireless connection and remembers it.
+  If USB only is on for that phone, it asks before turning it off. Refused while an install is running.
 - Devices are labelled **USB** or **Wi-Fi**, and if the same phone is connected both ways the
   app says so — large APKs are much faster over the cable.
 - Reconnects to the last wireless device on startup, and retries a dropped one at most three times
@@ -209,7 +211,7 @@ python3 tests/acceptance.py      # all scenarios (≈10 min); exits non-zero if 
 python3 tests/acceptance.py 10 13  # just some of them
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # run the app under 3.9
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # keep adb command logs
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.5.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.6.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # the diagnostics script only ever runs `adb version`
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # same tests against old code
 ```

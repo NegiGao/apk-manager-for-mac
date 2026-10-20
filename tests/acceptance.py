@@ -1261,10 +1261,56 @@ def s24():
     finally:
         I.close()
 
+def s25():
+    print("\n[25] 插着线一键转无线：「仅 USB」开着时先确认再关；成功后自动连上并选中无线；adbd 重启造成的 USB 闪断不把选择抢回去")
+    sup = lambda I: I.sup()
+    WIFI_T = "192.168.1.9:5555"
+    I = Inst("s25a", FAST)
+    try:
+        ready(I)
+        I.post("/api/supervisor/usb-only", {"serial": USB})
+        t0 = time.time()
+        r = I.post("/api/wireless/switch", {"serial": USB})
+        check(not r.get("ok") and r.get("code") == "usb_only_blocks_tcpip" and not after(I, t0, r"\btcpip\b"),
+              "「仅 USB」开着、没确认：不切无线，没有发 tcpip（%s）" % r.get("code"))
+        I.ctl(".tcpip_flap", "1")
+        t1 = time.time()
+        r = I.post("/api/wireless/switch", {"serial": USB, "exitUsbOnly": True}, timeout=60)
+        st = sup(I)
+        check(r.get("ok") and r.get("target") == WIFI_T and r.get("usbOnlyOff") and not st.get("usbOnly"),
+              "确认后：关闭「仅 USB」，转无线并连上 %s（%s）" % (r.get("target"), r.get("error") or "ok"))
+        check(len(after(I, t1, r"\btcpip\b")) == 1 and after(I, t1, r"\bconnect\b"), "只发了 1 次 tcpip，并发起连接")
+        check(st.get("selected") == WIFI_T, "当前设备自动切到这条无线连接（%s）" % st.get("selected"))
+        wait_for(lambda: any(d["serial"] == USB and d["state"] == "device" for d in sup(I)["devices"]), 15)
+        time.sleep(3)
+        check(sup(I).get("selected") == WIFI_T,
+              "adbd 重启后 USB 重新出现：不把选择抢回 USB（%s）" % sup(I).get("selected"))
+        check(WIFI_T in (I.get("/api/state").get("settings", {}).get("wirelessHistory") or []),
+              "记住了这个无线地址，之后可自动重连")
+    finally:
+        I.close()
+
+    # 安装进行中：不关「仅 USB」、不切无线
+    I = Inst("s25b", FAST)
+    try:
+        ready(I)
+        I.post("/api/supervisor/usb-only", {"serial": USB})
+        I.post("/api/import", {"path": APKS["termux"]})
+        I.hold("inst", r" install ")
+        I.post("/api/install", {"serial": USB, "mode": "all"})
+        I.wait_held("inst")
+        t = time.time()
+        r = I.post("/api/wireless/switch", {"serial": USB, "exitUsbOnly": True})
+        check(not r.get("ok") and sup(I).get("usbOnly") and not after(I, t, r"\btcpip\b"),
+              "安装进行中：拒绝（%s），「仅 USB」保持，没有发 tcpip" % r.get("code"))
+        I.release("inst")
+    finally:
+        I.close()
+
 ALL = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6, "7": s7, "8": s8, "9": s9,
        "10": s10, "11": s11, "12": s12, "13": s13, "14": s14, "15": s15, "16": s16,
        "17": s17, "18": s18, "19": s19, "20": s20, "20b": s20b_continue, "21": s21, "22": s22,
-       "23": s23, "24": s24}
+       "23": s23, "24": s24, "25": s25}
 if __name__ == "__main__":
     which = sys.argv[1:] or list(ALL)
     for k in which:

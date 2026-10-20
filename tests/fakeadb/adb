@@ -15,6 +15,7 @@
   $ROOT/.swap_after_install 存在 → 安装成功后，无线地址背后换成另一台手机（PHYS-B）
   $ROOT/.transport_id       USB 设备的 transport_id（默认 1）；为空字符串 → 不提供 transport_id
   $ROOT/.replug_after_install 存在 → 安装成功后 USB 被拔插（transport_id 加一，模拟换上同序列号的另一台）
+  $ROOT/.tcpip_flap         存在 → adb tcpip 后 USB 连接消失约 2 秒再出现（真机 adbd 重启的样子）
   $ROOT/.pm_error           存在 → pm 服务报错（shell 本身正常，echo 照常输出）
   $ROOT/.hold_<名字>        屏障：第一行是正则，第二行（可选）是放行次数 N。
                             第 N+1 条匹配的命令记录日志后停住，写出 $ROOT/.held_<名字>（内容为参数），
@@ -195,6 +196,12 @@ def main():
         die("error: device offline")
 
     if cmd == "tcpip":
+        if has(".tcpip_flap") and serial == USB:
+            # 模拟真机：adbd 重启，USB 连接短暂消失约 2 秒后又出现
+            open(ctl(".unplugged"), "w").write("1")
+            import subprocess
+            subprocess.Popen(["/bin/sh", "-c", "sleep 2; rm -f '%s'" % ctl(".unplugged")],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         print("restarting in TCP mode port: %s" % (args[1] if len(args) > 1 else "5555")); return 0
     if cmd == "shell":
         if has(".shell_fail"):

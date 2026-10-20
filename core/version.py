@@ -3,4 +3,4 @@
 import os
 
 # APKMGR_TEST_VERSION 只给自动化测试用：让同一份代码扮演「较旧的版本」，测试版本接管逻辑
-VERSION = os.environ.get("APKMGR_TEST_VERSION") or "1.5.5"
+VERSION = os.environ.get("APKMGR_TEST_VERSION") or "1.5.6"

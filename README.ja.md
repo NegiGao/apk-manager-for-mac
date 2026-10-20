@@ -64,7 +64,9 @@ Node も Xcode も不要です。外部に必要なのは `adb` だけで、そ�
 
 **ワイヤレス（Wi-Fi デバッグ）**
 - Android の「ワイヤレスデバッグ」画面に出る 6 桁コードでペア設定、または既知の `IP:ポート` へ直接接続。
-- ボタン 1 つでケーブル接続中の端末をワイヤレス化（`adb tcpip` ＋ IP 自動取得）。
+- ボタン 1 つでケーブル接続中の端末をワイヤレス化（`adb tcpip` ＋ IP 自動取得）。先に選ぶ必要はなく、接続（数回まで
+  再試行）してワイヤレス側を対象端末にし、アドレスを記憶します。その端末が「USB のみ」のときはオフにしてよいか先に
+  確認します。インストール中は実行しません。
 - 端末には **USB** / **無線** のラベルが付き、同じ端末が両方でつながっている場合は警告します
   （大きい APK はケーブルの方がかなり速いです）。
 - 起動時に前回のワイヤレス端末へ自動再接続。切断された端末への再接続は最大 3 回（5 秒 / 15 秒 / 45 秒）で、
@@ -193,7 +195,7 @@ python3 tests/acceptance.py      # 全シナリオ（約 10 分）。失敗が�
 python3 tests/acceptance.py 10 13  # 一部だけ
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # アプリを 3.9 で動かす
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # adb コマンド記録を残す
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.5.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.6.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # 診断スクリプトが実行する adb は `adb version` だけであることを確認
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # 同じテストを旧コードで実行
 ```

@@ -56,7 +56,8 @@
 
 **无线连接（Wi-Fi 调试）**
 - 用安卓「无线调试」界面的 6 位配对码配对，或直接连已知的 `IP:端口`。
-- 一个按钮把插线的手机转成无线（`adb tcpip` + 自动读取 IP）。
+- 一个按钮把插线的手机转成无线（`adb tcpip` + 自动读取 IP）：不用先选中，会自动连上（最多重试几次）、把当前设备
+  切到这条无线连接并记住地址。这台开着「仅 USB」时会先问你是否关闭；安装进行中不执行。
 - 设备会标注 **USB** 或 **无线**；同一台手机两种方式都连着时会提示——大安装包走数据线快得多。
 - 启动时自动重连上次用过的无线设备；掉线后最多重连 3 次（5 秒 / 15 秒 / 45 秒），之后停下等你手动处理。
 - 断开连接只针对你选中的那一个 `IP:端口`，没有「断开全部」。
@@ -170,7 +171,7 @@ python3 tests/acceptance.py      # 全部场景（约 10 分钟）；有失败�
 python3 tests/acceptance.py 10 13  # 只跑部分场景
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # 用 3.9 运行程序
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # 保留 adb 命令记录
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.5.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.6.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # 确认诊断脚本对 adb 只执行 `adb version`
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # 用同一套测试跑旧代码
 ```

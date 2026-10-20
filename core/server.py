@@ -281,7 +281,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/wireless/switch":
                 d = self._json_body()
                 return self._json(E.wireless_switch(d.get("serial"),
-                                                    int(d.get("port") or 5555)))
+                                                    int(d.get("port") or 5555),
+                                                    bool(d.get("exitUsbOnly"))))
             if path == "/api/wireless/forget":
                 return self._json(E.forget_wireless(self._json_body().get("hostPort")))
             if path == "/api/mark":

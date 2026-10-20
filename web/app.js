@@ -906,13 +906,22 @@ $("#btnConnect").onclick = async () => {
   else toast(t("wConnFail"), r.error || r.message || "", "err");
 };
 $("#btnSwitchWifi").onclick = async () => {
-  const d = currentDevice();
-  if (!d || d.wireless) { toast(t("wNeedUsb"), "", "warn"); return; }
+  // 当前选中的是用线连着的设备就用它；否则用正用线连着的那台（不用先去上面选）
+  let d = currentDevice();
+  if (!d || d.wireless || d.state !== "device") {
+    d = (S.devices || []).find(x => !x.wireless && x.state === "device");
+  }
+  if (!d) { toast(t("wNeedUsb"), "", "warn"); return; }
   $("#btnSwitchWifi").disabled = true;
-  const r = await api("/api/wireless/switch", { serial: d.serial });
+  let r = await api("/api/wireless/switch", { serial: d.serial });
+  if (!r.ok && r.code === "usb_only_blocks_tcpip") {
+    if (confirm(t("wConfirmExitUsbOnly", { d: r.arg || deviceLabel(d) }))) {
+      r = await api("/api/wireless/switch", { serial: d.serial, exitUsbOnly: true });
+    } else { $("#btnSwitchWifi").disabled = false; return; }
+  }
   $("#btnSwitchWifi").disabled = false;
   if (r.ok) {
-    toast(t("wSwitchOk", { t: r.target }), "", "ok");
+    toast(t("wSwitchOk", { t: r.target }), r.usbOnlyOff ? t("wUsbOnlyTurnedOff") : "", "ok");
     refreshState();
   } else toast(t("wSwitchFail"), errText(r), "err");
 };

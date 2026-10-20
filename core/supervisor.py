@@ -61,6 +61,7 @@ class Supervisor(object):
         self.devices = []
         self.devices_at = None          # 最近一次成功检测的时间
         self.selected = None
+        self.autosel_hold = {}          # serial -> 到期时间：刚被用户转成无线的 USB 设备，短时间内重新出现不抢回选择
         self.props = {}                 # serial -> getprop 结果
         self.wifi_meta = dict(st.get("wifiPhysical") or {})   # 无线地址 -> 物理序号
         self.reconnect = {}             # target -> {"attempts", "next", "gaveUp"}
@@ -472,7 +473,9 @@ class Supervisor(object):
           锁定跟着线走到那台（启动时插着线也一样），不用再去控制台手动选。安装进行中不动，等它结束或暂停后再跟。"""
         ready = [d for d in devs if d["state"] == "device"]
         usb_ready = [d for d in ready if not d["wireless"]]
-        newly = [d for d in usb_ready if prev.get(d["serial"]) != "device"]
+        now = _now()
+        self.autosel_hold = {s: t for s, t in self.autosel_hold.items() if t > now}
+        newly = [d for d in usb_ready if prev.get(d["serial"]) != "device" and d["serial"] not in self.autosel_hold]
         if self.usb_only:
             locked = self.usb_only.get("serial")
             if any(d["serial"] == locked for d in ready):

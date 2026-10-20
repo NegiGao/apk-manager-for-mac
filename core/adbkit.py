@@ -530,9 +530,14 @@ class Adb(object):
         text = ((out or "") + (err or "")).strip()
         if "restarting" not in text.lower() and "error" in text.lower():
             return False, None, text
-        time.sleep(1.2)
         target = "%s:%d" % (ip, port)
-        ok, msg, _ = self.connect(target)
+        # 手机上的 adbd 切到无线要一点时间：最多试 4 次（约 1 / 2 / 3 / 4 秒后），连上就停
+        ok, msg = False, text
+        for wait in (1.2, 2, 3, 4):
+            time.sleep(wait)
+            ok, msg, _ = self.connect(target)
+            if ok:
+                break
         return ok, target, (msg or text)
 
     def device_detail(self, serial):
