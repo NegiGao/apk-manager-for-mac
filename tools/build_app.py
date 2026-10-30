@@ -18,10 +18,11 @@ from make_icon import build_icns  # noqa: E402
 def _read_version():
     ns = {}
     exec(open(os.path.join(SRC, "core", "version.py"), encoding="utf-8").read(), ns)
-    return ns["VERSION"]
+    return ns
 
 
-VERSION = _read_version()
+_VNS = _read_version()
+VERSION, AUTHOR, HOMEPAGE = _VNS["VERSION"], _VNS["AUTHOR"], _VNS["HOMEPAGE"]
 
 LAUNCHER = r'''#!/bin/bash
 # APK Manager —— .app 启动器
@@ -118,7 +119,8 @@ def build():
         "LSMinimumSystemVersion": "10.13",
         "NSHighResolutionCapable": True,
         "LSApplicationCategoryType": "public.app-category.utilities",
-        "NSHumanReadableCopyright": "本地运行，不联网上传任何数据",
+        "NSHumanReadableCopyright": "© 2026 %s · %s" % (AUTHOR, HOMEPAGE),
+        "CFBundleGetInfoString": "APK Manager %s · %s · %s" % (VERSION, AUTHOR, HOMEPAGE),
     }
     with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
         plistlib.dump(info, f)

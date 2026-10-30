@@ -1307,10 +1307,53 @@ def s25():
     finally:
         I.close()
 
+def s26():
+    print("\n[26] 单独安装 / 单独卸载 / 版本与制作者信息")
+    I = Inst("s26", FAST)
+    try:
+        ready(I)
+        I.preinstall("termux", "com.termux")
+        import_all(I, ("termux", "newpipe", "seal"))
+        st = I.get("/api/state")
+        ab = st.get("about") or {}
+        vns = {}
+        exec(open(os.path.join(CODE_DIR, "core", "version.py")).read(), vns)
+        check(ab.get("author") == "NegiGao" and ab.get("homepage") == "https://github.com/NegiGao/apk-manager-for-mac"
+              and ab.get("version") == vns["VERSION"] == st.get("version"),
+              "/api/state 带版本、制作者、GitHub 地址（%s / %s / %s）" % (ab.get("version"), ab.get("author"), ab.get("homepage")))
+        ids = {i["label"]: i["id"] for i in st["items"]}
+        t = time.time()
+        I.events.clear()
+        r = I.post("/api/install", {"serial": USB, "mode": "all", "ids": [ids["NewPipe"]]})
+        I.wait(lambda: any(e["type"] == "install_done" for e in I.events), timeout=30, what="单独安装完成")
+        inst = after(I, t, r" install ")
+        it = items(I)
+        check(r.get("ok") and len(inst) == 1 and "newpipe" in inst[0],
+              "单独安装：只对这一个 APK 发了 1 次 install（%s）" % [a.split("/")[-1] for a in inst])
+        check(it["NewPipe"]["status"] == "success" and it["Termux"]["status"] == "pending" and it["Seal"]["status"] == "pending",
+              "只有这一项变成已安装，其他项保持原样（%s / %s / %s）" % (it["NewPipe"]["status"], it["Termux"]["status"], it["Seal"]["status"]))
+
+        I.post("/api/mark", {"serial": USB})
+        I.wait(lambda: (items(I)["Termux"].get("installed") or {}).get("state") == "same", what="标记")
+        t = time.time()
+        I.events.clear()
+        r = I.post("/api/uninstall", {"serial": USB, "packages": ["com.termux"], "labels": {"com.termux": "Termux"}})
+        I.wait(lambda: any(e["type"] == "uninstall_done" for e in I.events), timeout=30, what="卸载完成")
+        un = after(I, t, r" uninstall ")
+        check(r.get("ok") and len(un) == 1 and un[0].endswith("com.termux"),
+              "单独卸载：只对这一个包发了 uninstall（%s）" % un)
+        it = items(I)
+        check((it["Termux"].get("installed") or {}).get("state") == "none"
+              and (it["NewPipe"].get("installed") or {}).get("state") == "same",
+              "卸载后：这一项标为未安装，其他已安装的不受影响（%s / %s）" % (
+                  (it["Termux"].get("installed") or {}).get("state"), (it["NewPipe"].get("installed") or {}).get("state")))
+    finally:
+        I.close()
+
 ALL = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6, "7": s7, "8": s8, "9": s9,
        "10": s10, "11": s11, "12": s12, "13": s13, "14": s14, "15": s15, "16": s16,
        "17": s17, "18": s18, "19": s19, "20": s20, "20b": s20b_continue, "21": s21, "22": s22,
-       "23": s23, "24": s24, "25": s25}
+       "23": s23, "24": s24, "25": s25, "26": s26}
 if __name__ == "__main__":
     which = sys.argv[1:] or list(ALL)
     for k in which:

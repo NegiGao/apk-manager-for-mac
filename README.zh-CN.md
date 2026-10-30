@@ -26,7 +26,8 @@
 - 把 APK（或整个文件夹）拖进窗口。支持 `.apk` / `.xapk` / `.apks` / `.apkm`，分包会自动用
   `install-multiple` 一起装。
 - 拖动调整顺序，也能按应用名 / 文件名 / 包名 / 大小 / 版本号 / 添加时间一键排序。
-- **按顺序安装**：一个装完再装下一个，进度实时显示。
+- **按顺序安装**：一个装完再装下一个，进度实时显示。也可以点每一行的**单独安装**，只装这一个；当前设备上已经
+  装着这个应用时，这一行还会出现**卸载**（会先确认，并写明是哪台设备）。
 - **当前完成后暂停**：正在装的这一个装完就停，不会中途打断；**继续安装**只装剩下的。往一台已经装过一部分的
   设备上再装时，会先问「只装剩下的 / 全部重装」，不会盲目从头来。
 - **插上数据线的手机自动成为当前设备。** USB 连接的手机就绪时，如果当前没选设备、选的是 Wi-Fi 设备、
@@ -171,8 +172,9 @@ python3 tests/acceptance.py      # 全部场景（约 10 分钟）；有失败�
 python3 tests/acceptance.py 10 13  # 只跑部分场景
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # 用 3.9 运行程序
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # 保留 adb 命令记录
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.6.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.7.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # 确认诊断脚本对 adb 只执行 `adb version`
+python3 tests/ui_check.py        # 无头 Chromium：版本 / 制作者显示与每行按钮
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # 用同一套测试跑旧代码
 ```
 
@@ -215,6 +217,9 @@ platform-tools，而且只在你点那个按钮时才会发生。
 
 ---
 
-## 许可
+## 制作者 / 许可
+
+制作：**NegiGao** —— https://github.com/NegiGao/apk-manager-for-mac （版本号和这个地址在程序顶部、
+「设置 → 关于」里也能看到）。
 
 MIT，见 [LICENSE](LICENSE)。

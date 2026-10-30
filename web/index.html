@@ -11,7 +11,7 @@
 <div id="dropveil"><div class="veil-inner"><div class="veil-icon">⬇</div><div data-i18n="veilMain"></div><div class="veil-sub" data-i18n="veilSub"></div></div></div>
 
 <header class="topbar">
-  <div class="brand"><span class="logo">A</span><div><div class="t1" data-i18n="appName"></div><div class="t2" data-i18n="appTag"></div></div></div>
+  <div class="brand"><span class="logo">A</span><div><div class="t1"><span data-i18n="appName"></span> <span id="appVerBadge" class="ver-badge"></span></div><div class="t2" data-i18n="appTag"></div><div class="t3" id="aboutLine"></div></div></div>
   <div class="device-box">
     <button id="bgChip" class="bg-chip" type="button"></button>
     <select id="deviceSel"></select>
@@ -231,6 +231,10 @@
     <h3 data-i18n="setOut"></h3>
     <p class="muted" data-i18n="setOutTip"></p>
     <div class="dz-row"><input id="extractDir" type="text"><button id="btnSaveDir" class="primary small" data-i18n="save"></button></div>
+  </div>
+  <div class="card">
+    <h3 data-i18n="setAbout"></h3>
+    <div id="aboutBox" class="about-box"></div>
   </div>
   <div class="card">
     <h3 data-i18n="setAdb"></h3>

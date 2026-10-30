@@ -29,7 +29,7 @@ bash "/Applications/APK Manager.app/Contents/Resources/tools/mac_diagnose.sh"
 | A4 | 把 .app 放进名字带中文和空格的文件夹（如 `~/下载 测试/`），再双击 | 正常启动 | 同 A1 |
 | A5 | 连续快速双击 3 次 | 只有 1 个后台进程；窗口被重新拉起 | 诊断第 6 节只有 1 个 `app.py --app-mode` |
 | A6 | 开两个窗口（再双击一次） | 控制台「后台调度线程」= 1 | 诊断第 6 节 `scheduler threads: 1` |
-| A7 | 控制台显示的版本 = Finder「显示简介」里的版本 | 一致（1.5.6） | 诊断第 2 节 version 与第 6 节 version |
+| A7 | 控制台显示的版本 = Finder「显示简介」里的版本 | 一致（1.5.7） | 诊断第 2 节 version 与第 6 节 version |
 | A8 | 旧版运行中直接打开新版 | 1.5.2 之前的旧版：不自动关闭，弹提示请你手动退出；1.5.2 及以后：空闲时被接管，安装 / 读取列表 / 提取中继续用旧版 | 诊断第 6 节 version |
 | A9 | 用新版覆盖旧版后打开 | 原来的队列、顺序、方案、设置都在 | 界面对照 |
 | A10 | 关掉窗口，等 30 秒 | `app.py --app-mode` 进程消失；adb 服务（如有）仍在，这是正常的共享服务 | 诊断第 5、6 节 |
@@ -77,7 +77,7 @@ bash "/Applications/APK Manager.app/Contents/Resources/tools/mac_diagnose.sh"
 | A4 | 日本語・空白を含むフォルダに入れて起動 | 正常に起動 | A1 と同じ |
 | A5 | 素早く 3 回ダブルクリック | バックグラウンドは 1 つだけ | 診断 6 の `app.py --app-mode` が 1 つ |
 | A6 | ウインドウを 2 つ開く | スケジューラスレッド = 1 | 診断 6 の `scheduler threads: 1` |
-| A7 | コンソールのバージョン = Finder「情報を見る」のバージョン | 一致（1.5.6） | 診断 2 と 6 |
+| A7 | コンソールのバージョン = Finder「情報を見る」のバージョン | 一致（1.5.7） | 診断 2 と 6 |
 | A8 | 旧版が動いている状態で新版を開く | 1.5.2 より前の旧版：自動では終了せず、手動で終了するよう案内。1.5.2 以降：待機中なら交代、インストール・一覧読み込み・抽出中は旧版を使い続ける | 診断 6 |
 | A9 | 旧版を上書きして開く | 一覧・順番・プリセット・設定が残っている | 画面で確認 |
 | A10 | ウインドウを閉じて 30 秒待つ | `app.py --app-mode` が消える。adb サーバ（あれば）は残る（共有サーバなので正常） | 診断 5・6 |
@@ -123,7 +123,7 @@ It is read-only: the only adb command it runs is `adb version` (it never connect
 | A4 | Put the .app in a folder whose name has CJK characters and spaces | Starts normally | As A1 |
 | A5 | Double-click three times quickly | One background process; window re-opened | §6 has a single `app.py --app-mode` |
 | A6 | Open two windows | Scheduler threads = 1 | §6 `scheduler threads: 1` |
-| A7 | Console version = Finder "Get Info" version | Same (1.5.6) | §2 vs §6 |
+| A7 | Console version = Finder "Get Info" version | Same (1.5.7) | §2 vs §6 |
 | A8 | Open the new version while the old one is running | Older than 1.5.2: not closed; a note asks you to quit it. 1.5.2+: replaced when idle; kept while installing, loading the app list or extracting | §6 version |
 | A9 | Replace the old app and open | Queue, order, saved orders and settings are kept | UI |
 | A10 | Close the window, wait 30 s | `app.py --app-mode` is gone; the adb server (if any) stays — it's a shared daemon | §5, §6 |

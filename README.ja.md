@@ -26,7 +26,9 @@ Node も Xcode も不要です。外部に必要なのは `adb` だけで、そ�
 - APK（フォルダごとでも可）をウインドウにドラッグ。`.apk` / `.xapk` / `.apks` / `.apkm` に対応し、
   分割 APK は自動で `install-multiple` を使います。
 - ドラッグで並べ替え。アプリ名・ファイル名・パッケージ名・サイズ・バージョン・追加順でも整列できます。
-- **この順番でインストール**：1 件ずつ順に実行し、進捗をその場で表示。
+- **この順番でインストール**：1 件ずつ順に実行し、進捗をその場で表示。各行の**これだけインストール**で 1 件だけ
+  入れることもできます。選択中の端末にすでに入っている場合は、その行に**アンインストール**も表示します（先に確認し、
+  対象端末も表示）。
 - **この 1 件の後で一時停止**で、実行中の APK が終わったところできれいに止まります。**続きをインストール**は
   残りだけを入れます。一部インストール済みの端末に再度インストールするときは「残りだけ／すべて入れ直す」を
   先に確認し、いきなり最初からやり直しません。
@@ -195,8 +197,9 @@ python3 tests/acceptance.py      # 全シナリオ（約 10 分）。失敗が�
 python3 tests/acceptance.py 10 13  # 一部だけ
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # アプリを 3.9 で動かす
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # adb コマンド記録を残す
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.6.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.7.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # 診断スクリプトが実行する adb は `adb version` だけであることを確認
+python3 tests/ui_check.py        # ヘッドレス Chromium：バージョン／制作者表示と各行のボタン
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # 同じテストを旧コードで実行
 ```
 
@@ -244,6 +247,9 @@ sleep 頼みではありません。`delivery_check.py` はリリース ZIP を�
 
 ---
 
-## ライセンス
+## 制作者 / ライセンス
+
+制作：**NegiGao** — https://github.com/NegiGao/apk-manager-for-mac（バージョンとこのアドレスはアプリ上部と
+「設定 → このアプリについて」にも表示されます）。
 
 MIT — [LICENSE](LICENSE) を参照してください。

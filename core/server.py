@@ -12,7 +12,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .paths import STAGING_DIR, ICON_DIR, BASE_DIR
-from .version import VERSION
+from .version import VERSION, AUTHOR, HOMEPAGE
 
 # 只服务这几种静态文件，用小表代替 mimetypes 模块
 CTYPES = {
@@ -144,6 +144,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 st = E.state()
                 st["version"] = VERSION
+                st["about"] = {"version": VERSION, "author": AUTHOR, "homepage": HOMEPAGE}
                 st["runtime"] = {"python": sys.executable,
                                  "pythonVersion": "%d.%d.%d" % sys.version_info[:3],
                                  "pid": os.getpid()}

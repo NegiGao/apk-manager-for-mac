@@ -27,7 +27,9 @@ no Node, no Xcode. The only external dependency is `adb`, which the app can down
 - Drag APKs (or a whole folder) onto the window. `.apk`, `.xapk`, `.apks` and `.apkm` all work —
   split bundles are installed with `install-multiple` automatically.
 - Reorder by dragging, or sort by app name / file name / package / size / version / date added.
-- **Install in order**, one after another, with live progress.
+- **Install in order**, one after another, with live progress — or press **Install this** on any row to
+  install just that one APK. If the selected device already has it, the row also offers **Uninstall**
+  (asks first and names the device).
 - **Pause after current** stops cleanly once the APK in progress finishes; **Continue** picks up
   only what's left. Installing to a device that already got part of the batch asks first —
   *install the remaining* or *reinstall everything* — instead of blindly starting over.
@@ -211,8 +213,9 @@ python3 tests/acceptance.py      # all scenarios (≈10 min); exits non-zero if 
 python3 tests/acceptance.py 10 13  # just some of them
 APKMGR_TEST_SERVER_PY=/path/to/python3.9 python3 tests/acceptance.py   # run the app under 3.9
 APKMGR_TEST_EVIDENCE=./evidence python3 tests/acceptance.py            # keep adb command logs
-python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.6.zip --py39 /path/to/python3.9
+python3 tests/delivery_check.py --zip APK-Manager-mac-v1.5.7.zip --py39 /path/to/python3.9
 python3 tests/diag_check.py      # the diagnostics script only ever runs `adb version`
+python3 tests/ui_check.py        # headless Chromium: version/author line and per-row buttons
 APKMGR_TEST_CODE=/path/to/old/checkout python3 tests/acceptance.py 17   # same tests against old code
 ```
 
@@ -266,6 +269,9 @@ you when that's the reason.
 
 ---
 
-## License
+## Author / License
+
+Made by **NegiGao** — https://github.com/NegiGao/apk-manager-for-mac (the version and this link are
+also shown at the top of the app and under Settings → About).
 
 MIT — see [LICENSE](LICENSE).

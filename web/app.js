@@ -161,7 +161,11 @@ function renderQueue() {
     if (it.minSdk) tags.push(`<span class="tag">${escapeHtml(t("tagMinSdk", { n: it.minSdk }))}</span>`);
     const hint = (it.status === "failed" || it.status === "unverified" || it.status === "cancelled"
       || it.status === "pending_verify") ? codeHint(it.code, it.arg) : "";
-    const installed = it.installed && it.installed.state && it.installed.state !== "none";
+    // 「卸载」只在已安装检测确认这台（当前选中的）设备上装着时出现
+    const curSerial = ($("#deviceSel") || {}).value || "";
+    const installed = it.installed && it.installed.state && it.installed.state !== "none"
+      && (!it.installed.serial || it.installed.serial === curSerial);
+    const busyRow = !!(S.job && S.job.running) || it.status === "installing";
     li.innerHTML = `
       <span class="handle">⠿</span>
       <span class="idx">${i + 1}</span>
@@ -171,21 +175,43 @@ function renderQueue() {
         <div class="sub">${escapeHtml(it.package || it.file)} · ${it.versionName ? "v" + escapeHtml(it.versionName) + " · " : ""}${it.sizeText || ""}</div>
         <div class="tagline">${tags.join("")}</div>
       </div>
+      <div class="row-actions">
+        <button class="ghost small in1" ${busyRow ? "disabled" : ""} title="${escapeHtml(t("installOneTip"))}">${escapeHtml(t("installOne"))}</button>
+        ${installed ? `<button class="ghost small un1" ${busyRow ? "disabled" : ""} title="${escapeHtml(t("uninstallOneTip"))}">${escapeHtml(t("uninstall"))}</button>` : ""}
+      </div>
       <div class="status ${it.status || "pending"}">
         <div>${escapeHtml(statusText(it))}</div>
         ${hint ? `<div class="hintline">${escapeHtml(hint)}</div>` : ""}
       </div>
-      ${installed ? `<button class="ghost small uninst">${escapeHtml(t("uninstall"))}</button>` : ""}
       <button class="rm" title="${escapeHtml(t("removeFromQueue"))}">✕</button>`;
     li.querySelector(".rm").onclick = async () => {
       await api("/api/queue/remove", { ids: [it.id] });
       refreshState();
     };
-    const ub = li.querySelector(".uninst");
+    li.querySelector(".in1").onclick = () => installOne(it);
+    const ub = li.querySelector(".un1");
     if (ub) ub.onclick = () => uninstall([it.package], { [it.package]: it.label });
     list.appendChild(li);
   });
   wireDrag();
+}
+
+/* 版本 / 制作者 / GitHub 地址 */
+function renderAbout() {
+  const a = S.about || {};
+  const v = a.version || S.version || "";
+  const badge = $("#appVerBadge");
+  if (badge) badge.textContent = v ? "v" + v : "";
+  if (v) document.title = t("appName") + " v" + v;
+  const link = a.homepage ? `<a href="${escapeHtml(a.homepage)}" target="_blank" rel="noopener">${escapeHtml(a.homepage.replace(/^https?:\/\//, ""))}</a>` : "";
+  const line = $("#aboutLine");
+  if (line) line.innerHTML = (a.author ? escapeHtml(t("madeBy", { a: a.author })) : "") + (link ? " · " + link : "");
+  const box = $("#aboutBox");
+  if (box) box.innerHTML =
+    `<span class="k">${escapeHtml(t("aboutVersion"))}</span><span>${escapeHtml(v ? "v" + v : "—")}</span>` +
+    `<span class="k">${escapeHtml(t("aboutAuthor"))}</span><span>${escapeHtml(a.author || "—")}</span>` +
+    `<span class="k">GitHub</span><span>${link || "—"}</span>` +
+    `<span class="k">${escapeHtml(t("aboutLicense"))}</span><span>MIT</span>`;
 }
 
 /* 拖拽排序 */
@@ -416,6 +442,14 @@ async function startInstall(mode, ids) {
   toast(t("tCantStart"), errText(r), "err");
 }
 $("#btnInstall").onclick = () => startInstall(null);
+/* 只安装这一项（显式操作：即使这台设备上已装过也重新安装这一个） */
+async function installOne(it) {
+  const j = S.job || {};
+  if (j.paused && ((j.remaining || 0) > 0 || (j.pending || 0) > 0)) {
+    if (!confirm(t("installOneEndsPaused", { n: it.label || it.file }))) return;
+  }
+  return startInstall("all", [it.id]);
+}
 $("#btnInstallNew").onclick = () => {
   const ids = S.items.filter(i => !i.installed ||
     ["none", "update", "unknown"].includes(i.installed.state)).map(i => i.id);
@@ -516,11 +550,13 @@ async function uninstall(pkgs, labels) {
   if (!serial) { toast(t("tNoDevice"), t("tNoDeviceSub"), "warn"); return; }
   const names = pkgs.map(p => (labels && labels[p]) || p);
   const keep = !!S.settings.keepDataOnUninstall;
+  const dev = (S.devices || []).find(d => d.serial === serial);
+  const devLine = t("tUninstallOn", { d: dev ? deviceLabel(dev) : serial });
   const tip = pkgs.length === 1
     ? t("tConfirmUn1", { n: names[0] })
     : t("tConfirmUnN", { n: pkgs.length }) + "\n\n" + names.slice(0, 12).join("\n") +
       (pkgs.length > 12 ? "\n…" : "");
-  if (!confirm(tip + "\n\n" + (keep ? t("tKeepNote") : t("tDataNote")))) return;
+  if (!confirm(tip + "\n" + devLine + "\n\n" + (keep ? t("tKeepNote") : t("tDataNote")))) return;
   const r = await api("/api/uninstall", { serial, packages: pkgs, labels: labels || {}, keepData: keep });
   if (!r.ok) { toast(t("tUninstallFail"), errText(r), "err"); return; }
   toast(t("tUninstallStart"), String(pkgs.length), "warn");
@@ -657,6 +693,7 @@ function applySup(st) {
     S.job = Object.assign({}, S.job || {}, st.install);
   }
   renderSupAll();
+  if (S._lastSel !== st.selected) { S._lastSel = st.selected; renderQueue(); }   // 「卸载」按钮跟着当前设备变
 }
 async function loadSup() {
   const r = await api("/api/supervisor");
@@ -1047,7 +1084,8 @@ async function refreshState() {
   S.settings = st.settings || {};
   S.settings.__adbOk = !!(st.adb && st.adb.available);
   S.job = st.job || null;
-  S.version = st.version; S.runtime = st.runtime;
+  S.version = st.version; S.runtime = st.runtime; S.about = st.about || S.about;
+  renderAbout();
   renderQueue();
   const sel = $("#profileSel");
   const cur = sel.value;
@@ -1090,11 +1128,14 @@ function handleEvent(e) {
     case "usb_only_follow":
       toast(t("tUsbOnlyFollow"), t("tUsbOnlyFollowMsg", { d: e.name || e.serial, o: e.previousName || e.previous || "—" }), "ok");
       break;
-    case "job":
+    case "job": {
+      const wasRunning = !!(S.job && S.job.running);
       S.job = e.job;
       renderJobControls();
+      if (wasRunning !== !!(S.job && S.job.running)) renderQueue();   // 安装进行中时禁用每行的按钮
       if (S.tab === "console") renderConsole();
       break;
+    }
     case "install_start":
       $("#progressWrap").classList.remove("hidden");
       $("#progressBar").style.width = "0";
